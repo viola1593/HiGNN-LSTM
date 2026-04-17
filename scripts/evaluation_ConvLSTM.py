@@ -1,0 +1,697 @@
+
+import argparse
+import glob
+import json
+import matplotlib
+import matplotlib.pyplot as plt
+import numpy as np
+import os
+import pandas as pd
+import pytorch_lightning as pl
+import torch
+import torchmetrics
+from typing import Any, Dict
+import xarray as xr
+import yaml
+
+
+from datamodules.TWSA_datamodule2D import TWSA_Datamodule2D_new
+from losses.kge import KGE
+from losses.utils_for_nans import mean_with_nans, median_with_nans
+from models.pl_convlstm import ConvLSTMModule
+
+
+
+# Function to load yaml configuration file
+def read_config(config_path):
+    with open(config_path) as file:
+        config = yaml.safe_load(file)
+
+    return config
+
+def save_config(config, path):
+    with open(path, 'w') as file:
+        yaml.dump(config, file)
+
+
+def generate_trainer(config: Dict[str, Any]) -> pl.Trainer:
+    """Generate a pytorch lightning trainer."""
+
+    # early_stopping_callback = pl.callbacks.EarlyStopping(monitor="val_rmse", mode="min")
+    loggers = [pl.loggers.WandbLogger(
+                    name=f"evaluate_{config['experiment']['save_dir'].split('/')[-1]}",
+                    save_dir=config["experiment"]["save_dir"],
+                    project=config["wandb"]["project"],
+                    # entity=config["wandb"]["entity"],
+                    resume="allow",
+                    config=config,
+                    mode=config["wandb"].get("mode", "online"))
+                    ]
+
+    return pl.Trainer(
+        **config["pl"],
+        default_root_dir=config["experiment"]["save_dir"],
+        #logger=loggers,
+        #callbacks=[early_stopping_callback]
+        )
+
+
+def create_experiment_dir(config: Dict[str, Any], experiment_path) -> str:
+    """Create experiment directory.
+
+    Args:
+        config: config file
+
+    Returns:
+        config with updated save_dir
+    """
+    #os.makedirs(config["experiment"]["exp_dir"], exist_ok=True)
+    exp_dir_path = os.path.join(f"eval_on_test", experiment_path)
+    os.makedirs(exp_dir_path, exist_ok=True)
+    # os.makedirs(os.path.join(exp_dir_path, "SSIM"), exist_ok=True)
+    # os.makedirs(os.path.join(exp_dir_path, "ExpVar"), exist_ok=True)
+    # os.makedirs(os.path.join(exp_dir_path, "KGE"), exist_ok=True)
+    # os.makedirs(os.path.join(exp_dir_path, "BasinPlots"), exist_ok=True)
+    # os.makedirs(os.path.join(exp_dir_path, "Predictions"), exist_ok=True)
+    # os.makedirs(os.path.join(exp_dir_path, "NSE"), exist_ok=True)
+    # os.makedirs(os.path.join(exp_dir_path, "RMSE"), exist_ok=True)
+    config["experiment"]["save_dir"] = exp_dir_path
+    
+    return config
+
+def plot_adj_mat(adj, save_dir=None):
+    plt.imshow(adj, cmap='Reds')
+    plt.colorbar()
+    plt.savefig(save_dir)
+    plt.close()
+
+def plot_pixel_adj_mat(adj, data_lonlat, save_dir=None):
+    plt.scatter(data_lonlat[:,0], data_lonlat[:,1], c=adj, cmap='viridis', s=1)
+    plt.colorbar()
+    plt.savefig(save_dir)
+    plt.close()
+
+def plot_prediction(y_hat, y_true, datamodule, antarctica=None, save_dir=None, title='TWSA Prediction (Test Set)'):
+    #lon, lat = datamodule.data_pred.land[0][:,0], datamodule.data_pred.land[0][:,1]
+
+    # if antarctica is not None:
+    #     antarctica_mask =  datamodule.get_landmask_without_antarctica()
+    #     lon = lon[antarctica_mask]
+    #     lat = lat[antarctica_mask]
+
+    vmax = 100
+    f, ( ax1, ax2, ax3) = plt.subplots(3,1,figsize=(5,10))
+    # p0 = ax0.imshow(y_last, cmap='coolwarm',  vmin=-vmax, vmax=vmax)
+    p1 = ax1.imshow(y_hat, cmap='coolwarm', vmin=-vmax, vmax=vmax)
+    p2 = ax2.imshow(y_true, cmap='coolwarm', vmin=-vmax, vmax=vmax)
+    ape = abs(y_hat-y_true)/(abs(y_true)+ 1e-5) * 100
+    p3 = ax3.imshow(ape, cmap='Reds', vmin=0, vmax=100)
+    #p3 = ax3.imshow(abs(y_hat-y_true)/(y_true+ 1e-5), cmap='Reds', vmin=0, vmax=1)
+    # ax0.set_title('Last TWSA')
+    # ax1.set_title('Predicted TWSA')
+    # ax2.set_title('True TWSA')
+    # ax3.set_title('Absolute Difference')
+    f.suptitle(title)
+    format_global_plot(ax1, noticks_x=True, noticks_y=True)
+    format_global_plot(ax2, noticks_x=True, noticks_y=True)
+    format_global_plot(ax3, noticks_x=True, noticks_y=True)
+    
+    plt.tight_layout()
+    cbar1 = plt.colorbar(p1, ax=ax1)
+    cbar1.set_label('TWSA [cm]', fontsize=12)
+    cbar1.set_ticks([-80,-40, 0, 40, 80])
+    cbar2 = plt.colorbar(p2, ax=ax2)
+    cbar2.set_label('TWSA [cm]', fontsize=12)
+    cbar2.set_ticks([-80,-40, 0, 40, 80])
+    cbar3 = plt.colorbar(p3, ax=ax3, extend='max')
+    cbar3.set_label('Difference [%]', fontsize=12)
+    if save_dir is not None:
+        plt.savefig(save_dir, dpi=300)
+        plt.close()
+
+def format_global_plot(ax, noticks_x=False, noticks_y=False):
+    ax.tick_params(axis='both', direction='in', labelsize=12)
+    
+    
+    if noticks_x:
+        ax.set_xticks([])
+    else:
+        ax.set_xticks([-90, 0, 90])
+        ax.set_xlabel('Longitude')
+       
+    if noticks_y:
+        ax.set_yticks([])
+    else:
+        ax.set_yticks([-30,  0, 30, 60])
+        ax.set_ylabel('Latitude')
+
+def plot_NSE_or_KGE(nse, datamodule, title='NSE', save_dir=None, vmin=0):
+    land_mask = (datamodule.get_landmask_without_antarctica() & datamodule.data_train.land_ocean_mask[0])
+    # x, y = datamodule.data_pred.land[0][:,0][land_mask], datamodule.data_pred.land[0][:,1][land_mask]
+    f, ax0 = plt.subplots(1,1, figsize=(5,4))
+    # -0.41 everything below is worse than a mean prediction for each time step
+    cmap = plt.cm.Reds.reversed()
+    if vmin is not None:
+        cmap.set_under('blue')
+    p0 = ax0.imshow(nse, vmin=vmin, vmax=1,  cmap=cmap)
+    # format_global_plot(ax0)
+    plt.colorbar(p0, ax=ax0, extend='min')
+    plt.figtext(0.5, 0.00, f'Mean {title}: {nse.mean().item():.2f}', ha='center', fontsize=10)
+
+    ax0.set_title(title) 
+    plt.tight_layout()
+
+    plt.savefig(save_dir, dpi=300)
+    plt.close()
+
+def plot_KGE(kge, datamodule, save_dir=None):
+    
+   
+    land_mask = (datamodule.get_landmask_without_antarctica() & datamodule.data_train.land_ocean_mask[0])
+
+
+    f, ((ax0, ax1), (ax2, ax3)) = plt.subplots(2,2, figsize=(20,10))
+    # -0.41 everything below is worse than a mean prediction for each time step
+    p0 = ax0.imshow(kge[0],   vmin=-0.41)
+    plt.colorbar(p0, ax=ax0, extend='min')
+    p1 = ax1.imshow(kge[1], vmin=-1, vmax=1, cmap='coolwarm')
+    plt.colorbar(p1, ax=ax1)
+    p2 = ax2.imshow(kge[2],   norm=matplotlib.colors.LogNorm( vmax=10,))
+
+    plt.colorbar(p2, ax=ax2, extend='max')
+    p3 = ax3.imshow(kge[3],  cmap='coolwarm', vmin=0, vmax=2)
+ 
+    plt.colorbar(p3, ax=ax3, extend='both')
+    ax0.set_title('KGE')
+    ax1.set_title('Correlation')
+    ax2.set_title('Alpha ($Std_{pred}/Std_{true}$)')
+    ax3.set_title('Beta ($Mean_{pred}/Mean_{true}$)')
+
+    f.suptitle('Pixelwise Means over Validation sequences')
+    # add text to the plot in lower right corner
+    plt.text(0.5, -0.1, 'Min/Max Alpha: {:.2f} / {:.2f}'.format(np.nanmin(kge[2]), np.nanmax(kge[2])),  horizontalalignment='center',
+
+     verticalalignment='center', transform=ax3.transAxes)
+    plt.text(0.5, -0.2, 'Min/Max Beta: {:.2f} / {:.2f}'.format(np.nanmin(kge[3]), np.nanmax(kge[3])),  horizontalalignment='center',
+
+     verticalalignment='center', transform=ax3.transAxes)
+    
+    plt.text(0.5, -0.3, 'Mean KGE: {:.2f} '.format(np.nanmean(kge[0][land_mask])),  horizontalalignment='center',
+     verticalalignment='center', transform=ax3.transAxes)
+    
+    plt.tight_layout()
+
+    plt.savefig(save_dir)
+    plt.close()
+
+def calculate_plot_kge_per_pixel(validation_step_outputs, datamodule=None, save_dir=None):
+    #twsa_mean, twsa_std = datamodule.scaling_mean_std[0]
+    y_hat, y_true = zip(*validation_step_outputs)
+    y_hat = torch.cat(y_hat, dim=0) #*torch.Tensor(twsa_std.values) + torch.Tensor(twsa_mean.values)
+    y_true = torch.cat(y_true, dim=0) #*torch.Tensor(twsa_std.values) + torch.Tensor(twsa_mean.values)
+    
+    kge_list = []
+    # for every element in the batch
+    for pred, true in zip(y_hat, y_true):
+        kge = KGE(pred, true).cpu()
+        kge_list.append(kge)
+    #calculate the mean KGE over the batch
+    pixel_kge = torch.stack(kge_list).mean(axis=0)
+
+    # print(y_hat.shape, y_true.shape)
+
+    # kge=KGE(y_hat, y_true).cpu()
+    
+    print('KGE, correlation', kge[:2])
+    plot_KGE(pixel_kge, datamodule, save_dir=save_dir)
+    return {'kge': mean_with_nans(pixel_kge[0]).cpu().tolist(), 'corr': mean_with_nans(pixel_kge[1]).cpu().tolist(), 
+            'alpha': mean_with_nans(pixel_kge[2]).cpu().tolist(), 'beta': mean_with_nans(pixel_kge[3]).cpu().tolist(), 
+            'kge_meadian':median_with_nans(pixel_kge[0]).cpu().tolist()}
+
+def plot_ssim(y_pred, y_true, datamodule, index, antarctica_mask=None, climatology=None, save_dir=None, f=None, ax=None):
+    """Calculate the Structural Similarity Index (SSIM) between two tensors.
+    y_pred: predicted values, shape [T, N]
+    y_true: true values, shape [T, N]
+    datamodule: datamodule containing the land_ocean_mask"""
+
+
+    ssim_metric = torchmetrics.image.StructuralSimilarityIndexMeasure(reduction='none')
+    # import pdb; pdb.set_trace()
+    y_pred = y_pred.unsqueeze(1)
+    y_true = y_true.unsqueeze(1)
+    # compute SSIM for the current time step
+    ssim = ssim_metric(y_pred, y_true)
+    ssim_zeros = ssim_metric(torch.zeros(y_true.shape), y_true)
+    
+
+    if climatology is not None:
+
+        ssim_clim = ssim_metric(torch.Tensor(climatology).unsqueeze(1), y_true)
+    else: ssim_clim = None
+
+    
+    f, ax = plt.subplots(1,1, figsize=(5,3))
+    # plot the SSIM values
+    ax.plot(ssim.cpu().numpy(), label='Forecast vs. Ground Truth', marker='o')
+    if climatology is not None:
+        ax.plot(ssim_clim.cpu().numpy(), label='Climatology vs. Ground Truth', marker='o', color='orange')
+    format_ssim_plot(ax, ssim_zeros, index)
+    if save_dir is not None:
+        plt.savefig(save_dir)
+        plt.close()
+    return f, ax, ssim, ssim_zeros, ssim_clim
+
+def format_ssim_plot(ax, ssim_zeros, index):
+    ax.plot(ssim_zeros.cpu().numpy(), label='Baseline SSIM (Zeros vs. Ground Truth)', marker='o', color='black', linestyle='--')
+    ax.text(0, 1.01, 'Optimal Value', color='gray', fontsize=10, ha='left', va='bottom')
+    ax.axhline(y=1, color='gray', linestyle='--')
+    ax.axhline(y=0, color='gray', linestyle='--')
+    ax.set_xlabel('Time Step')
+    ax.set_ylabel('SSIM')
+    ax.set_title(f'SSIM over Timesteps of forecast - {index}')
+    ax.set_ylim(-0.05, 1.07)
+    ax.set_yticks(np.linspace(0,1.0,6))
+    ax.legend()
+    plt.tight_layout()
+    return ax
+
+def plot_explained_variance(y_hat, y_true, datamodule, save_dir=None):
+
+    # calculate mean without antarctica as it is already removed in the predictions
+    antarctica_mask = datamodule.get_landmask_without_antarctica()
+    land_mask = datamodule.data_train.land_ocean_mask[0]
+    mask = land_mask & antarctica_mask
+
+    #lon, lat = datamodule.data_pred.land[0][:,0], datamodule.data_pred.land[0][:,1]
+    
+    # flip the cmap colors and add color for below 0 values
+    cmap = plt.cm.Reds.reversed()
+    cmap.set_under('blue')
+    exp_var = torchmetrics.ExplainedVariance(multioutput='raw_values')(y_hat, y_true)
+    f, ax = plt.subplots(1,1)
+    p=ax.imshow(exp_var, cmap=cmap,  vmin=0)
+    # p=ax.scatter(lon[antarctica_mask], lat[antarctica_mask], c=exp_var[antarctica_mask], cmap=cmap, s=1, vmin=0)
+    ax.set_title(f'Explained Variance per Pixel')
+    ax.set_xlabel('Longitude')
+    ax.set_ylabel('Latitude')
+    plt.tight_layout()
+    plt.colorbar(p, ax=ax, extend='min')
+    # add caption with the mean explained variance 
+    
+    plt.figtext(0.5, 0.00, f'Mean Explained Variance: {exp_var[mask].mean().item():.2f}', ha='center', fontsize=12)
+    if save_dir is not None:
+        plt.savefig(save_dir)
+        plt.close()
+
+def recover_month_index(month_sin, month_cos):
+    # shape: [B, T]
+    angle = torch.atan2(month_sin, month_cos)  # range: [-π, π]
+    month_float = (angle % (2 * np.pi)) * 12 / (2 * np.pi)  # range: [0, 12)
+    month_index = month_float.long()  # round down to nearest integer (0–11)
+    return month_index
+
+
+def compute_climatology(dataset: xr.DataArray, lsm):
+    
+    """Compute climatology from the dataset."""
+    climatology = dataset.groupby('time.month').mean(dim='time').values  # [12, N]
+    
+    return climatology  # [12, 180, 360]
+
+
+def nse(y_hat, y_true):
+    """Calculate Nash-Sutcliffe Efficiency (NSE) with long term mean (climatology) or ground truth.
+    y_hat: shape [T (time steps), N (num nodes)]
+    y_true: shape [T, N]"""
+    numerator = torch.sum((y_true - y_hat) ** 2, dim=0)
+    denominator = torch.sum((y_true - torch.mean(y_true, dim=0, keepdim=True)) ** 2, dim=0)
+    return 1 - numerator / (denominator + 1e-8)
+
+
+def _mape(y_hat, y_true):
+    """Calculate Mean Absolute Percentage Error (MAPE) between two tensors."""
+    # Avoid division by zero
+    epsilon = 1e-8
+    return torch.mean(torch.abs((y_true - y_hat) / (y_true + epsilon)), dim=1) * 100  # in percentage
+
+def _rmse(y_hat, y_true):
+    """Calculate Root Mean Squared Error (RMSE) between two tensors."""
+    return torch.sqrt(torch.mean((y_true - y_hat) ** 2, dim=1))  # RMSE
+
+def _smape(y_hat, y_true):
+    """Calculate Symmetric Mean Absolute Percentage Error (SMAPE) between two tensors."""
+    # Avoid division by zero
+    epsilon = 1e-8
+    return torch.mean(torch.abs(y_true - y_hat) / (torch.abs(y_true) + torch.abs(y_hat) + epsilon), dim=1) * 100  # in percentage
+
+def calculate_per_timestep_scores(y_hat, y_true, climatology, scores_dict, metrics_dict, lsm=None):
+    """Calculate per timestep scores for the given predictions and ground truth."""
+    
+    y_hat_deseas = y_hat - climatology
+    y_true_deseas = y_true - climatology
+    if lsm is not None:
+        # mask out the antarctica pixels
+        
+        y_hat = y_hat[:, lsm]
+        y_true = y_true[:, lsm]
+        y_hat_deseas = y_hat_deseas[:, lsm]
+        y_true_deseas = y_true_deseas[:, lsm]
+        climatology = climatology[:, lsm]
+
+    y_hat = y_hat.reshape(y_hat.shape[0], -1) # [seq_len, HxW]
+    y_true = y_true.reshape(y_true.shape[0], -1)
+    y_hat_deseas = y_hat_deseas.reshape(y_hat_deseas.shape[0], -1)
+    y_true_deseas = y_true_deseas.reshape(y_true_deseas.shape[0], -1)
+    climatology = climatology.reshape(climatology.shape[0], -1)
+    
+    for metric_name, metric_func in metrics_dict.items():
+        if metric_name == 'exp_var':
+            # time step as last dim
+            y_hat_new = y_hat.transpose(1,0)
+            y_true_new  = y_true.transpose(1,0)
+            y_hat_deseas_new  = y_hat_deseas.transpose(1,0)
+            y_true_deseas_new  = y_true_deseas.transpose(1,0)
+            climatology_new  = climatology.transpose(1,0)
+            
+            # Calculate scores for each time step
+            scores = metric_func(y_hat_new, y_true_new)
+            # Calculate deseasonalized scores
+            deseas_scores = metric_func(y_hat_deseas_new, y_true_deseas_new)
+            # Calculate climatology scores
+            clim_scores = metric_func(torch.Tensor(climatology_new), y_true_new)
+        
+        else:
+            # Calculate scores for each time step
+            scores = metric_func(y_hat, y_true)
+            # Calculate deseasonalized scores
+            deseas_scores = metric_func(y_hat_deseas, y_true_deseas)
+            # Calculate climatology scores
+            clim_scores = metric_func(torch.Tensor(climatology), y_true)
+        
+        scores_dict[f'{metric_name}'].append(scores.cpu().numpy())
+        scores_dict[f'{metric_name}_deseas'].append(deseas_scores.cpu().numpy())
+        scores_dict[f'{metric_name}_clim'].append(clim_scores.cpu().numpy())
+    return scores_dict
+
+
+def evaluate(experiment_path, gpu):
+    """Evaluation Script."""
+    # torch.set_float32_matmul_precision("medium")
+    
+    pl.seed_everything(42, workers=True)
+    config = read_config(os.path.join(experiment_path,  'config.yaml'))
+    # exchange devices to given gpu in config
+    config['pl']['devices'] = [gpu]
+
+    config = create_experiment_dir(config, experiment_path)
+
+    # generate trainer
+    trainer = generate_trainer(config)
+
+    twsa_sequence_data = TWSA_Datamodule2D_new(**config['datamodule'])
+    twsa_sequence_data.setup(stage='fit')
+    output_seq_len = config['datamodule']['output_seq_len']
+    
+
+    # Recursively search for .ckpt files in all subfolders
+    ckpt_files = glob.glob(os.path.join(experiment_path, "**", "*.ckpt"), recursive=True)
+    
+    if ckpt_files:
+        # Use the latest checkpoint (by modification time)
+        latest_ckpt = min(ckpt_files, key=os.path.getmtime)
+        print(f"Found checkpoint: {latest_ckpt}")
+    else:
+        print("No checkpoint found.")
+
+  
+    #load model from checkpoint
+    model = ConvLSTMModule.load_from_checkpoint(latest_ckpt, **config["model"], 
+                                          kernel_size=(3,3),  map_location=f'cuda:{gpu}',                           
+                                # sequence_length=twsa_sequence_data.input_seq_len, 
+                                horizon=twsa_sequence_data.target_seq_len)
+   
+    
+    from pytorch_lightning.utilities.model_summary import ModelSummary
+    print(ModelSummary(model))
+    # import pdb; pdb.set_trace()     
+
+ # --------------------------------------------------------------------------------------------------------------
+ # Validation scores
+ # --------------------------------------------------------------------------------------------------------------
+ # 
+    test_metrics = trainer.test(model, twsa_sequence_data)
+    # test before prediction important so trainer has access to datamodules unnormalization during prediction
+
+ # --------------------------------------------------------------------------------------------------------------
+ # Plotting predictions of last element in validation time series
+ # --------------------------------------------------------------------------------------------------------------
+ #  
+    
+    dataloader_pred = twsa_sequence_data.predict_dataloader(period=twsa_sequence_data.train_val_test_periods['test'])
+
+    try:  
+        predictions = torch.load(os.path.join(config["experiment"]["save_dir"],"predictions.pt"))
+    except FileNotFoundError:
+        predictions = trainer.predict(model, dataloader_pred) # check which time period is being used, should be validation time period
+        torch.save(predictions, os.path.join(config["experiment"]["save_dir"],"predictions.pt"))
+    try: 
+        climatology = torch.load(os.path.join(config["experiment"]["save_dir"],"climatology.pt"))
+    except FileNotFoundError:
+        
+        twsa_train = twsa_sequence_data.unnormalize_twsa(twsa_sequence_data.data_train.ds_timeslice['twsa'])
+        climatology = compute_climatology(twsa_train, lsm=twsa_sequence_data.data_train.ds_timeslice['lsm'])
+        torch.save(climatology, os.path.join(config["experiment"]["save_dir"],"climatology.pt"))
+
+    # import pdb; pdb.set_trace()
+    
+    # get mask to mask antarctica out in the evaluation
+    antarctica_mask =  twsa_sequence_data.get_landmask_without_antarctica()
+    #climatology = climatology[:,antarctica_mask]  # [12, N]
+
+    metrics_dict = {'rmse': _rmse, 'mape': _mape, 'smape': _smape, 
+                    'exp_var': torchmetrics.regression.ExplainedVariance(multioutput='raw_values')}
+
+    per_timestep_scores = {'rmse': [], 'rmse_deseas': [], 'rmse_clim': [], 
+                               'mape': [], 'mape_deseas': [], 'mape_clim': [], 
+                               'smape': [], 'smape_deseas': [], 'smape_clim': [],
+                               'exp_var': [], 'exp_var_deseas': [], 'exp_var_clim': []
+                               }
+    basin_per_timestep_scores = {'rmse': [], 'rmse_deseas': [], 'rmse_clim': [], 
+                               'mape': [], 'mape_deseas': [], 'mape_clim': [], 
+                               'smape': [], 'smape_deseas': [], 'smape_clim': [],
+                               'exp_var': [], 'exp_var_deseas': [], 'exp_var_clim': []
+                               }
+    pixel_kge_scores = []
+    pixel_nse_scores = []
+    basin_kge_scores = []
+    clim_basin_kge_scores = []
+
+    horizon = twsa_sequence_data.target_seq_len
+    
+    # iterate over the batches in the predictions for the evaluations
+    i = 0
+    for batch in predictions:
+        twsa_pred_batch = batch[0] # shape: [batchsize, output_seq_len, H, W]
+        twsa_true_batch = batch[1] # shape: [batchsize, output_seq_len, H, W]
+        input_sequence = batch [2] # shape: [batchsize, input_seq_len, features, H, W]
+        
+
+        # get months for each input in the sequence
+        months_input_sequences = recover_month_index(batch[2][:, :,-1], batch[2][:, :,-2]) # last element (-1) is sine encoding, -2 is cos encoding
+        months_output_sequences = torch.stack([(months_input_sequences[:,-1] +i +1)%12 for i in range(output_seq_len)], dim=1)
+
+
+
+        ssims_zeros = []
+        ssims_clim = []
+        ssims_pred_NoClim = []
+        ssims_pred_normal = []
+      
+
+
+        # iterate over the batch to evaluate each forecast item
+        # twsa_pred_batch: [B, T, H, W], twsa_true_batch: [B, T, H, W], months_output_sequences: [B, T, H, W]
+        for twsa_pred, twsa_true, months in zip(twsa_pred_batch, twsa_true_batch, months_output_sequences):
+
+            # predictions with seasonality removed
+            twsa_pred_deseas = twsa_pred-climatology[months[:,0,0]] # get the right months to subtract climatology (months are the same for all nodes so get month for node 0)
+            twsa_true_deseas = twsa_true-climatology[months[:,0,0]]
+
+            # --------------------------------------------------------------------------------------------------------------
+            # RMSE scores -- per timestep/averaged over all land nodes
+            # --------------------------------------------------------------------------------------------------------------  
+
+            per_timestep_scores = calculate_per_timestep_scores(twsa_pred, 
+                                                                twsa_true, 
+                                                                climatology[months[:,0,0]], 
+                                                                per_timestep_scores,
+                                                                metrics_dict, 
+                                                                lsm=antarctica_mask)
+            
+        
+
+
+            # --------------------------------------------------------------------------------------------------------------
+            # Explained Variance scores -- pixelwise
+            # --------------------------------------------------------------------------------------------------------------  
+            if False:
+                plot_explained_variance(twsa_pred, 
+                                        twsa_true, 
+                                        twsa_sequence_data, 
+                                        save_dir=os.path.join(config["experiment"]["save_dir"], f'ExpVar/expVar{i}.png'))
+                
+                
+                # # without seasonality
+                plot_explained_variance(twsa_pred_deseas, 
+                                        twsa_true_deseas, 
+                                    twsa_sequence_data, 
+                                    save_dir=os.path.join(config["experiment"]["save_dir"], f'ExpVar/NoClimExpVar{i}.png'))
+            
+         # --------------------------------------------------------------------------------------------------------------
+            # Plot predictions
+            # --------------------------------------------------------------------------------------------------------------  
+            if False:
+                for time_step in range(twsa_pred.shape[0]):
+                    
+                    plot_prediction(twsa_pred[time_step], twsa_true[time_step], twsa_sequence_data, antarctica=True, 
+                                    save_dir=os.path.join(config["experiment"]["save_dir"], f"Predictions/Seq_{i}_timestep_{time_step}"))
+
+
+            # --------------------------------------------------------------------------------------------------------------
+            # NSE scores -- per pixel
+            # --------------------------------------------------------------------------------------------------------------  
+
+            #calculate NSE (versus long term mean)
+            if False:
+                pixel_nse = nse(twsa_pred, twsa_true).cpu()
+                pixel_nse_scores.append(pixel_nse)
+                # clim_pixel_nse = nse(torch.Tensor(climatology[months[:,0]]), twsa_true).cpu()
+                # clim_pixel_nse_scores.append(clim_pixel_nse)
+                if True:
+                    plot_NSE_or_KGE(pixel_nse, twsa_sequence_data, 
+                                    save_dir=os.path.join(config["experiment"]["save_dir"], f'NSE/Vmin0NSE{i}.png'), vmin=0)
+                    # plot_NSE_or_KGE(clim_pixel_nse, twsa_sequence_data, 
+                    #                 save_dir=os.path.join(config["experiment"]["save_dir"], f'NSE/NoVminClimNSE{i}.png'), vmin=-100)
+            
+            
+            
+            
+            # --------------------------------------------------------------------------------------------------------------
+            # KGE scores -- per pixel, deseasonalized
+            # --------------------------------------------------------------------------------------------------------------  
+
+            #calculate KGE
+            if False:
+                pixel_kge = KGE(twsa_pred_deseas.reshape(horizon, -1), twsa_true_deseas.reshape(horizon, -1)).cpu() 
+                plot_KGE(pixel_kge.reshape(4, 180,360), twsa_sequence_data, save_dir=os.path.join(config["experiment"]["save_dir"], f'KGE/NoClimPixelKGE{i}.png'))
+                pixel_kge_scores.append(pixel_kge)
+
+            # --------------------------------------------------------------------------------------------------------------
+            # KGE scores -- basinwise, deseasonalized
+            # --------------------------------------------------------------------------------------------------------------  
+            # basin_kge = KGE(torch.Tensor(pred_basin_mean-basin_mean_climatology), torch.Tensor(true_basin_mean-basin_mean_climatology)).cpu()
+            # basin_kge_scores.append(basin_kge)
+
+            # clim_basin_kge = KGE(torch.Tensor(basin_mean_climatology), torch.Tensor(true_basin_mean)).cpu()
+            # clim_basin_kge_scores.append(clim_basin_kge)
+            
+
+
+            # --------------------------------------------------------------------------------------------------------------
+            # SSIM scores -- per timestep because captures the structural similarity of the prediction to the ground truth
+            # --------------------------------------------------------------------------------------------------------------  
+            # calculate and plot SSIM for sequence with removed climatology/seasonality
+            if False:
+                f, ax, ssim_clim, ssim_zeros_clim, _ = plot_ssim(twsa_pred_deseas, twsa_true_deseas, 
+                                                                        twsa_sequence_data,
+                                                                    antarctica_mask=antarctica_mask, 
+                                                                    index=i,
+                            save_dir=os.path.join(config["experiment"]["save_dir"], f'SSIM/NoClim_ssim_{i}.png'))
+                
+                # # calculate and plot SSIM for forecast sequence and compare to pure climatology forecast SSIM
+                f_clim, ax_clim, ssim, ssim_zeros, ssim_climvstrue = plot_ssim(twsa_pred, twsa_true, twsa_sequence_data,
+                                                                        antarctica_mask=antarctica_mask,
+                                                                            index=i,
+                                                                    climatology=climatology[months[:,0,0]],
+                                                save_dir=os.path.join(config["experiment"]["save_dir"], f'SSIM/ssim_vs_clim_{i}.png'))
+            # ssims_zeros.append(ssim_zeros)
+            # ssims_clim.append(ssim_climvstrue.cpu().numpy())
+            # ssims_pred_normal.append(ssim.cpu().numpy())
+            i += 1
+
+            
+
+    # --------------------------------------------------------------------------------------------------------------
+    # save mean scores for forecasting time steps-- rmse, mape, explained variance
+    # --------------------------------------------------------------------------------------------------------------  
+
+    MEAN_per_timestep_scores = {}
+    STD_per_timestep_scores = {}
+
+    
+    
+    
+    for key, metric_list in per_timestep_scores.items():
+        # convert to numpy and stack and calculate mean over all the batches
+        MEAN_per_timestep_scores[key] = np.stack(metric_list).mean(axis=0).tolist()
+        STD_per_timestep_scores[key] = np.stack(metric_list).std(axis=0).tolist()
+
+    with open(os.path.join(config["experiment"]["save_dir"], "mean_timestep_scores.json"), "w") as f:
+            json.dump(MEAN_per_timestep_scores, f, indent=4)
+            json.dump(STD_per_timestep_scores, f, indent=4)
+
+    with open(os.path.join(config["experiment"]["save_dir"], "test_metrics.json"), "w") as f:
+        json.dump(test_metrics, f, indent=4)
+
+
+    
+    # --------------------------------------------------------------------------------------------------------------
+    # save deseasonalized KGE scores
+    # --------------------------------------------------------------------------------------------------------------
+# 
+    # MEAN_pixel_kge = np.stack(pixel_kge_scores).mean(axis=0) # average over all batches
+
+    # MEAN_basin_kge_scores = np.stack(basin_kge_scores).mean(axis=0)
+
+    # MEAN_clim_basin_kge_scores = np.stack(clim_basin_kge_scores).mean(axis=0)
+
+    # kge_scores_dict = {
+    #     "mean_pixel_kge": np.nanmean(MEAN_pixel_kge, axis=1)[0].tolist(),
+    #     "mean_pixel_corr": np.nanmean(MEAN_pixel_kge, axis=1)[1].tolist(), ## Does not make much sense to report this as these means won't add up to the KGE
+    #     "mean_pixel_alpha": np.nanmean(MEAN_pixel_kge, axis=1)[2].tolist(),
+    #     "mean_pixel_beta": np.nanmean(MEAN_pixel_kge, axis=1)[3].tolist(),
+
+    #    # "mean_kge_per_basin": MEAN_basin_kge_scores[0].tolist(),
+    #     # "mean_corr_per_basin": basin_MEAN_kge_scores[1].tolist(),
+    #     # "mean_alpha_per_basin": basin_MEAN_kge_scores[2].tolist(),
+    #     # "mean_beta_per_basin": basin_MEAN_kge_scores[3].tolist(),
+
+    #     # "mean_clim_basin_kge": MEAN_clim_basin_kge_scores[0].tolist(),
+    # }
+
+    # with open(os.path.join(config["experiment"]["save_dir"], "deseasonnalized_KGE_scores.json"), "w") as f:
+    #         json.dump(kge_scores_dict, f, indent=4)
+
+    # save config
+    save_config(config, os.path.join(config["experiment"]["save_dir"], "config.yaml"))
+
+
+def start():
+    """Start training."""
+    # Command line arguments
+    parser = argparse.ArgumentParser(
+        prog="baseline_evaluation.py", description="Evaluates a trained model given the path to its config and chkpts."
+    )
+
+    parser.add_argument("--exp_path", help="Path to the experiment directory", required=True)
+    parser.add_argument(
+        "--gpu", help="GPU device ID", default=0, type=int,
+    )
+
+    args = parser.parse_args()
+
+    evaluate(args.exp_path, gpu=args.gpu)
+
+
+if __name__ == "__main__":
+    start()

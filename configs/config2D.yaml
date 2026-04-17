@@ -1,0 +1,64 @@
+experiment:
+  experiment_name: "smallermodel_detrendeddata_baseline_adamW_200epochs"
+  exp_dir: "experiments/baseline2D/final" 
+wandb:
+  project: twsa 
+  mode: online
+
+model:
+ input_dim: 12 # TWSA + 16 features +2 from temporal encoding
+ hidden_dim: 32
+ #kernel_size: 2
+ num_layers: 2
+ learning_rate: 0.001
+
+ 
+
+
+datamodule:
+ ds_path: data/latest_data/TWSA-REC_era5_detrend_latavg.nc #data/twsa_rec_era5_global_1deglatAVG_detrend.nc
+ train_val_test_split: [0.7, 0.2, 0.1]
+ input_seq_len: 12 # Number of time steps in input sequence
+ output_seq_len: 6 # Number of time steps in output sequence
+#  horizon: 1 # Number of time steps between last observation in input sequence and target
+ delay: 0 # Number of time steps between last observation in input sequence and target
+ debug: False
+ batch_size: 8
+ num_workers: 4
+ features_nanfill: 0
+ input_vars: 
+  - twsa
+  - sst # sea surface temperature
+  - sp # surface pressure
+  - t2m # 2m temperature
+  - si10 # 10 m wind speed
+  - tp # total precipitation
+  # - swvl1
+  # - swvl2
+  # - swvl3
+  # - swvl4 #  soil moisture level 1-4
+  # - lai_lv # leaf area index low vegetation
+  # - lai_hv # leaf area index high vegetation
+  - lsm # land sea mask
+  - e # evaporation
+  - ro # runoff
+  - pev # potential evaporation
+ # - z # geopotential
+
+
+
+pl: # all flags to pytorch lightning trainer
+  devices: [4]
+  accelerator: gpu
+  max_epochs: 400
+  max_steps: -1
+  check_val_every_n_epoch: 1
+  deterministic: True
+  detect_anomaly: False
+  fast_dev_run: False
+  log_every_n_steps: 1
+  overfit_batches: 1
+  # precision: bf16-mixed
+ 
+load_checkpoint: null #experiments/baseline2D/overfit/BN/batchnorm_afterConv_03-17-2025_15:47:57/twsa/bc3dhfqx/checkpoints/epoch=999-step=1000.ckpt
+debug: False

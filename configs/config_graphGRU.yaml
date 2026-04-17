@@ -1,0 +1,58 @@
+experiment:
+  experiment_name: "test_1degres_coarseocean_edgelearner"
+  exp_dir: "experiments/1deg/GRUgraph" 
+wandb:
+  project: twsa_fullres 
+  mode: online
+
+modeltype: GRUGC
+model:
+ #num_nodes: 2592 # 36*72 nodes in the grid graph
+ num_input_features: 17 # 16 features+4 from positional encoding
+ num_hidden_features: 64
+ output_dim: 1
+ output_seq_len: 1
+ enc_layers: 4
+ gcn_layers: 3 # too many layers lead to oversmoothing
+ learning_rate: 0.0001
+ learn_adj: True
+ max_num_edges: 20000 
+ graph_edge_encoding_dim: 4
+ alpha1: 0.1
+ alpha2: 2.0
+ #data_image_shape: [36, 72]
+
+ 
+
+
+datamodule:
+ ds_path: data/twsa_rec_era5_global_1deg.nc
+ local_lag: 12 # Number of time steps in input sequence
+ delay: 12 # Number of time steps between last observation in input sequence and target
+ debug: False
+ batch_size: 12
+ num_workers: 8
+ aoi_longitude: null
+  # - -15 
+  # - 0
+ aoi_latitude: null
+  # - 35
+  # - 25
+
+
+
+pl: # all flags to pytorch lightning trainer
+  devices: [7]
+  accelerator: gpu
+  max_epochs: 10
+  max_steps: -1
+  check_val_every_n_epoch: 1
+  deterministic: True
+  detect_anomaly: False
+  fast_dev_run: False
+  log_every_n_steps: 1
+  overfit_batches: 0 
+  precision: bf16-mixed
+ 
+load_checkpoint: null #experiments/test/baseline_test_horizon12_50epochs_12-13-2024_18:03:48/twsa/sbmgbwmz/checkpoints/epoch=15-step=22128.ckpt
+

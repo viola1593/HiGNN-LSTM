@@ -1,0 +1,63 @@
+# Data and checkpoints
+data/
+!data/README.md
+checkpoints/
+!checkpoints/README.md
+
+# Outputs and results
+eval_on_*/
+eval_GNNembedding*/
+figures/
+experiments/
+results/
+neurips_exp/
+finetune/
+feature_importance/
+fi_analysis/
+figures_deaseas/
+graphs/
+
+# Pycache and Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+*.so
+*.egg
+*.egg-info/
+dist/
+build/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*.sublime-project
+*.sublime-workspace
+
+# Environment
+.env
+venv/
+env/
+ENV/
+
+# Logs
+*.log
+wandb/
+lightning_logs/
+
+# OS
+.DS_Store
+Thumbs.db
+*.tmp
+
+# Jupyter
+.ipynb_checkpoints/
+*.ipynb_checkpoints
+
+# Testing
+.pytest_cache/
+.coverage
+htmlcov/

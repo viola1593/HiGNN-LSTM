@@ -1,0 +1,44 @@
+experiment:
+  experiment_name: "baseline_test_horizon12_50epochs_fromchkpt"
+  exp_dir: "experiments/debug" 
+wandb:
+  project: twsa 
+  mode: online
+
+model:
+ n_features: 20 # 16 feauters+4 from positional encoding
+ hidden_size: 2
+ seq_len: 12 # Number of time steps in input sequence
+ num_layers: 2
+ dropout: 0.0
+ learning_rate: 0.001
+
+ 
+
+
+datamodule:
+ ds_path: data/twsa_rec_era5_global.nc
+ local_lag: 12 # Number of time steps in input sequence
+ horizon: 12 # Number of time steps between last observation in input sequence and target
+ debug: False
+ batch_size: 512
+ num_workers: 16
+ aoi_longitude: null # (-13, 45)
+ aoi_latitude: null # (70, 25)
+
+
+
+pl: # all flags to pytorch lightning trainer
+  devices: [6]
+  accelerator: gpu
+  max_epochs: 50
+  max_steps: -1
+  check_val_every_n_epoch: 1
+  deterministic: True
+  detect_anomaly: False
+  fast_dev_run: False
+  log_every_n_steps: 10
+  overfit_batches: 0 
+ 
+load_checkpoint: experiments/test/baseline_test_horizon12_50epochs_12-13-2024_18:03:48/twsa/sbmgbwmz/checkpoints/epoch=15-step=22128.ckpt
+
