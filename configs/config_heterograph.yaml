@@ -21,7 +21,7 @@ model:
 
 
 datamodule:
- ds_path: data/latest_data0326/TWSA-REC_era5_detrend_latavg.nc # data/twsa_rec_era5_global_1deg_detrend.nc
+ ds_path: data/latest_data/TWSA-REC_era5_detrend_latavg.nc # data/twsa_rec_era5_global_1deg_detrend.nc
  train_val_test_split: [0.7, 0.2, 0.1]
  input_seq_len: 12 # Number of time steps in input sequence
  delay: 0 # Number of time steps between last observation in input sequence and target

@@ -313,7 +313,6 @@ def main():
     dataset_twsa=dataset_twsa.assign_coords(time=dates)
 
     dataset_twsa = dataset_twsa.sel(time=slice(np.datetime64('2018-01-01'), np.datetime64('2025-12-31'))) # limit to GRACE-FO
-    import pdb; pdb.set_trace()
     print(dataset_twsa)
     if DETREND:
         ### detrend the twsa data
@@ -402,11 +401,6 @@ def main():
     # regridded_era5 = reindex_to_target(merged_era5, target_lat, target_lon)
     # Temporal matching
     match_df = match_timesteps(regridded_twsa.twsa, merged_era5, TOLERANCE_DAYS)
-
-
-    
-
-    import pdb; pdb.set_trace()
 
     # Add metadata to the dataset
     match_df.attrs['title'] = 'GRACE-derived TWSA and static variables of ERA5 regridded data'
