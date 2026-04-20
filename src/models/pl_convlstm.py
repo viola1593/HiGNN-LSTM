@@ -31,7 +31,6 @@ class ConvLSTMModule(pl.LightningModule):
         self.metrics = {'mse' : nn.MSELoss(),
                         'rmse': MeanSquaredError(squared=False), # RMSE
                         'explained_var': ExplainedVariance(),  
-                        # 'ssim' : torchmetrics.image.ssim.StructuralSimilarityIndexMeasure()
                         }
         
     def forward(self, x):
@@ -52,7 +51,6 @@ class ConvLSTMModule(pl.LightningModule):
         return pred   
     
     def training_step(self, batch, batch_idx):
-        # import pdb; pdb.set_trace()
 
         x, y = torch.Tensor(batch['x_sequence']), torch.Tensor(batch['y_timestep'])
         land_mask = torch.Tensor(batch['land_mask']).bool()        

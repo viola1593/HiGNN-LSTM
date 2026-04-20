@@ -1,9 +1,5 @@
-
 import argparse
 import glob
-import json
-from xml.parsers.expat import model
-import matplotlib
 import matplotlib.pyplot as plt
 import numpy as np
 import os
@@ -13,13 +9,11 @@ import torch
 import torchmetrics
 from typing import Any, Dict
 import xarray as xr
-import yaml
+
 
 from datamodules.TWSA_heterograph_datamodule import TWSA_HeteroGraphDatamodule
-from losses.kge import KGE
-from losses.utils_for_nans import mean_with_nans, median_with_nans
 from models.pl_hmmodel import HMModule
-
+from utils.utils import read_config, save_config
 
 
 TEST_BASIN_IDS = { # Basin name : Basin ID
@@ -39,28 +33,9 @@ TEST_BASIN_IDS = { # Basin name : Basin ID
                     "Ganges": 4030025450, # AS
                     "Indus": 4030033640, # AS
                     "Murray": 5030073410, # AUS
-                    # "Yukon": 8030005510,
-                    # "Nelson": 	7030022240,
-                    # "St Law": 	7030034520,
-                    # "Lake Chad North": 	1030040210,
-                    # "Lake Chad South": 	1030040190, 
-                    # "Ob": 	3030001840,
-                    # "Yenisey": 	3030004740,
-                    # "Lena": 	3030009130,
-                    # "Huanghe": 	4030007850
                   } 
 
 
-# Function to load yaml configuration file
-def read_config(config_path):
-    with open(config_path) as file:
-        config = yaml.safe_load(file)
-
-    return config
-
-def save_config(config, path):
-    with open(path, 'w') as file:
-        yaml.dump(config, file)
 
 
 def generate_trainer(config: Dict[str, Any]) -> pl.Trainer:
@@ -83,7 +58,6 @@ def create_experiment_dir(config: Dict[str, Any], dataset: str="test") -> str:
     Returns:
         config with updated save_dir
     """
-    #os.makedirs(config["experiment"]["exp_dir"], exist_ok=True)
     exp_dir_path = os.path.join(f"eval_on_{dataset}", config["experiment"]["save_dir"])
     os.makedirs(exp_dir_path, exist_ok=True)
     os.makedirs(os.path.join(exp_dir_path, "KGE"), exist_ok=True)
@@ -93,60 +67,7 @@ def create_experiment_dir(config: Dict[str, Any], dataset: str="test") -> str:
     config["experiment"]["save_dir"] = exp_dir_path
     
     return config
-
-def plot_prediction_vert(y_hat, y_true, datamodule, antarctica=None, start_date=None,
-                    save_dir=None, title='TWSA Prediction (Test Set)'):
-    """y_hat, y_true: [N, T]"""
-    lon, lat = datamodule.data_pred.land[0][:,0], datamodule.data_pred.land[0][:,1]
-
-    if antarctica is not None:
-        antarctica_mask =  (~datamodule.get_antarctica_landmask())
-        lon = lon[antarctica_mask]
-        lat = lat[antarctica_mask]
-
-    import matplotlib as mpl
-    from matplotlib.gridspec import GridSpec
-
-    vmax = 40
-    fontsize = 10
-    f = plt.figure(figsize=(5, 8))
-    # 6 map rows + 1 thin colorbar row
-    gs = GridSpec(7, 3, figure=f, height_ratios=[1,1,1,1,1,1,0.08],
-                  hspace=0.15, wspace=0.1)
-    axes = [[f.add_subplot(gs[i, j]) for j in range(3)] for i in range(6)]
-    cbar_axes = [f.add_subplot(gs[6, j]) for j in range(3)]
-
-    for i in range(y_hat.shape[1]):
-        p1 = axes[i][0].scatter(lon, lat, c=y_hat[:,i], cmap='coolwarm', marker='.', s=1, vmin=-vmax, vmax=vmax)
-        p2 = axes[i][1].scatter(lon, lat, c=y_true[:,i], cmap='coolwarm', marker='.', s=1, vmin=-vmax, vmax=vmax)
-        ape = (y_hat[:,i]-y_true[:,i])
-        p3 = axes[i][2].scatter(lon, lat, c=ape, cmap='RdBu', s=1, marker='.', vmin=-10, vmax=10)
-        axes[i][2].set_xlabel(f"MAD: {abs(ape).mean():.2f} cm", fontsize=fontsize)
-        axes[i][0].set_ylabel((start_date + pd.DateOffset(months=i)).strftime('%b %Y'), fontsize=fontsize+1)
-
-        format_global_plot(axes[i][0], noticks_x=True, noticks_y=True)
-        format_global_plot(axes[i][1], noticks_x=True, noticks_y=True)
-        format_global_plot(axes[i][2], noticks_x=True, noticks_y=True)
-
-    cbar_ticks = [-vmax, 0, vmax]
-    cbar_specs = [
-        ('coolwarm', -vmax, vmax, cbar_ticks, 'Prediction [cm]'),
-        ('coolwarm', -vmax, vmax, cbar_ticks, 'Target [cm]'),
-        ('RdBu',     -10,   10,  [-10, 0, 10], 'Difference [cm]'),
-    ]
-    for col, (cmap, vmin, vmax_c, ticks, label) in enumerate(cbar_specs):
-        sm = mpl.cm.ScalarMappable(cmap=cmap, norm=plt.Normalize(vmin=vmin, vmax=vmax_c))
-        cbar = f.colorbar(sm, cax=cbar_axes[col], orientation='horizontal', ticks=ticks)
-        cbar.set_label(label, fontsize=fontsize)
-        cbar.ax.tick_params(labelsize=fontsize)
-
-    axes[0][0].set_title('Prediction', fontsize=fontsize)
-    axes[0][1].set_title('Target', fontsize=fontsize)
-    axes[0][2].set_title('Pred-Target', fontsize=fontsize)
-    plt.tight_layout()
-    if save_dir is not None:
-        plt.savefig(save_dir, dpi=300)
-        plt.close()
+                 
 
 def plot_prediction(y_hat, y_true, datamodule, antarctica=None, start_date=None,
                     save_dir=None, title='TWSA Prediction (Test Set)'):
@@ -162,7 +83,6 @@ def plot_prediction(y_hat, y_true, datamodule, antarctica=None, start_date=None,
     f, axes = plt.subplots(3,6,figsize=(8,5))
     fontsize = 10
     for i in range(y_hat.shape[1]):
-    # p0 = ax0.scatter(lon, lat, c=y_last, cmap='coolwarm', s=1, vmin=-vmax, vmax=vmax)
         p1 = axes[0,i].scatter(lon, lat, c=y_hat[:,i], cmap='coolwarm',marker='.', s=1,vmin=-vmax, vmax=vmax)
         p2 = axes[1,i].scatter(lon, lat, c=y_true[:,i], cmap='coolwarm',marker='.', s=1,vmin=-vmax, vmax=vmax)
         ape = (y_hat[:,i]-y_true[:,i])
@@ -177,8 +97,7 @@ def plot_prediction(y_hat, y_true, datamodule, antarctica=None, start_date=None,
         format_global_plot(axes[2,i], noticks_x=True, noticks_y=True)
 
     cbar_ticks = [-vmax,0,vmax]
-    # cbar1 = plt.colorbar(p2, ax=[axes[0,5],axes[1, 5]], 
-    #                extend='both', shrink=0.8)
+
     cbar1 = plt.colorbar(p1, ax=axes[0,5], extend='both')
     cbar1.set_label('TWSA [cm]', fontsize=fontsize)
     cbar1.set_ticks(cbar_ticks)
@@ -372,12 +291,9 @@ def plot_basintwsa_timesteps(name, id, pred, true, clim,  ax, fontsize=14):
         
         if seq_idx == 0:
             ax.plot(x, t, label='Target TWSA', color='black', marker='.', linewidth=1.5)
-            # ax.plot(x, c, label='Climatology', linestyle='dotted', color='gray', linewidth=linewidth*2)
-            # Add dummy line for legend
-            # ax.plot([], [], color='royalblue', linewidth=linewidth, label='Predictions')
+
         else: 
             ax.plot(x, t, color='black', marker='.', linewidth=1.5)
-            # ax.plot(x, c, linestyle='dotted', color='gray', linewidth=linewidth)
         
         # Plot prediction with gradient color based on lead time
         for j in range(len(p) - 1):
@@ -402,15 +318,14 @@ def plot_basintwsa_per_lead(name, id, pred, true, seasonal, ax=None):
     ''' pred shape [B, T], true shape [B, T], clim shape [B, T] '''
     x = np.arange(pred.shape[0])
     pred = np.transpose(pred[:,:,0])
-    # fupeng = np.transpose(fupeng[:,:,0])
+
     true = np.transpose(true[:,:,0])
     seasonal = np.transpose(seasonal[:,:,0])
     linewidth = 1
-    cmap = 'Reds'
+
     cmapgnn = plt.cm.Reds
-    cmapfup = plt.cm.Blues
+
     colors_gnn = [cmapgnn(i / 10) for i in range(10)]
-    # colors_fup = [cmapfup(i /10) for i in range(10)]
     if ax is None:
         fig, ax = plt.subplots(figsize=(10,8))
     
@@ -420,23 +335,111 @@ def plot_basintwsa_per_lead(name, id, pred, true, seasonal, ax=None):
         if i ==0:
             ax.plot(x, t, label='GRACE-FO CSR RL06.3 ', color='black', marker='o')
             ax.plot(x, p, label='HiGNN', color = colors_gnn[i+4],  linewidth=linewidth)
-            # ax.plot(x, f, label='Li et al.', color = colors_fup[i+4],  linewidth=linewidth)
+
         else:
             i = i % 6
             ax.plot(x, t,  color='black', marker='o')
             ax.plot(x, p, color = colors_gnn[i+4], linewidth=linewidth, )
-            #ax.plot(x, c, linestyle='dotted', color='gray', linewidth=linewidth*2)
-            # ax.plot(x, f, color = colors_fup[i+4],  linewidth=linewidth)
+
         x+=1
 
     ax.set_title(f'{name} ({id})', fontsize=13, fontweight='bold')
-    # ax.set_xlabel('Sample', fontsize=11)
-    # ax.set_ylabel('TWSA (cm)', fontsize=11)
+
     ax.tick_params(axis='both', which='major', labelsize=10)
     ax.legend(fontsize=11, loc='best')
     ax.grid(True, which='both', axis='both', linestyle='--', color='gray', alpha=0.7)
 
     return ax
+
+
+def build_model_from_checkpoint(experiment_path, config, gpu, twsa_sequence_data):
+    # Recursively search for .ckpt files in all subfolders
+    ckpt_files = glob.glob(os.path.join(experiment_path, "**", "*.ckpt"), recursive=True)
+    
+    if ckpt_files:
+        # Use the latest checkpoint (by modification time)
+        latest_ckpt = min(ckpt_files, key=os.path.getmtime)
+        print(f"Found checkpoint: {latest_ckpt}")
+    else:
+        print("No checkpoint found.")
+        return None
+    #load model from checkpoint
+    model = HMModule.load_from_checkpoint(latest_ckpt, **config["model"], 
+                                          num_input_features=twsa_sequence_data.num_features,
+                                          num_ocean_features=twsa_sequence_data.num_ocean_features,
+                                            sequence_length=twsa_sequence_data.input_seq_len,
+                                            output_seq_len=twsa_sequence_data.target_seq_len, 
+                                            land_sea_mask=None,
+                                            map_location=f'cuda:{gpu}')
+   
+
+    model.model_summary()
+    return model
+
+def get_predictions(twsa_sequence_data, trainer, config, dataset='test', gpu=0):
+    if dataset == "test":
+        dataloader_pred = twsa_sequence_data.predict_dataloader(period=twsa_sequence_data.train_val_test_periods['test'])
+    elif dataset == "val":
+        dataloader_pred = twsa_sequence_data.predict_dataloader(period=twsa_sequence_data.train_val_test_periods['val'])
+    elif dataset == "train":
+        dataloader_pred = twsa_sequence_data.predict_dataloader(period=twsa_sequence_data.train_val_test_periods['train'])
+
+    elif dataset == "grace":
+        dataloader_pred = twsa_sequence_data.GRACE_dataloader()
+    
+    try:
+        predictions = torch.load(os.path.join(config["experiment"]["save_dir"],"predictions.pt"))
+    except FileNotFoundError:
+        model = build_model_from_checkpoint(config["experiment"]["save_dir"], config, gpu, twsa_sequence_data)
+
+        trainer.test(model, twsa_sequence_data)
+        # test before prediction important so trainer has access to datamodules unnormalization during prediction
+        predictions = trainer.predict(model, dataloader_pred) # predict usually selects val time period
+        torch.save(predictions, os.path.join(config["experiment"]["save_dir"],"predictions.pt"))
+    return predictions
+
+def get_climatology(twsa_sequence_data, config):
+    # compute climatology from training data
+    try: 
+        climatology = torch.load(os.path.join(config["experiment"]["save_dir"],"climatology.pt"))
+    except FileNotFoundError:
+        twsa_train = twsa_sequence_data.unnormalize_twsa(twsa_sequence_data.data_train.ds_timeslice['twsa'])
+        climatology = compute_climatology(twsa_train, 
+                                            twsa_sequence_data.data_train.land_ocean_mask)
+        torch.save(climatology, os.path.join(config["experiment"]["save_dir"],"climatology.pt"))
+    return climatology
+
+
+def get_months_output_sequences(months_input_sequences, output_seq_len):
+    months_output_sequences = [(months_input_sequences[:,:, -1] +i +1)%12 for i in range(output_seq_len)]
+    months_output_sequences = torch.stack([(months_input_sequences[:,:, -1] +i +1)%12 for i in range(output_seq_len)])  # [horizon, Total_B, N]
+    months_output_sequences = months_output_sequences.permute(1,2,0)  # [Total_B, N, horizon]
+    return months_output_sequences  
+
+def get_basin_wide_mean_twsa(twsa_pred, twsa_true, climatology, months_output_sequences, datamodule):
+    # calculate basin-wide mean TWSA for each prediction sequence
+    pred_basin_mean = []
+    true_basin_mean = []
+    basin_mean_climatology = []
+    pred_month = []
+    
+    for (pred, true, months) in zip(twsa_pred, twsa_true, months_output_sequences):
+        pred, true, basin_clim, basin_ids = basin_wide_mean_twsa(pred.permute(1,0),
+                                                                  true.permute(1,0), 
+                                                                  climatology[months[0]], 
+                                                                   datamodule)
+        pred_basin_mean.append(pred)
+        true_basin_mean.append(true)
+        basin_mean_climatology.append(basin_clim)
+        pred_month.append(months[0])
+    pred_basin_mean = np.stack(pred_basin_mean)  # [B, T (horizon), N_basins]
+    true_basin_mean = np.stack(true_basin_mean)  # [B, T(horizon), N_basins]
+    basin_mean_climatology = np.stack(basin_mean_climatology)  # [B, T(horizon), N_basins]
+    pred_months = np.stack(pred_month)  # [B, T(horizon)]
+    
+    return pred_basin_mean, true_basin_mean, basin_mean_climatology, pred_months, basin_ids
+
+
 
 def evaluate(experiment_path, gpu, dataset="test"):
     """Evaluation Script.
@@ -459,85 +462,34 @@ def evaluate(experiment_path, gpu, dataset="test"):
     twsa_sequence_data = TWSA_HeteroGraphDatamodule(**config['datamodule'])
     twsa_sequence_data.setup(stage='fit') #initializes data_train and data val from TWSA-rec data
     output_seq_len = config['datamodule']['output_seq_len']
-    
+    trainer.datamodule = twsa_sequence_data # assign datamodule to trainer for prediction
 
-    # Recursively search for .ckpt files in all subfolders
-    ckpt_files = glob.glob(os.path.join(experiment_path, "**", "*.ckpt"), recursive=True)
-    
-    if ckpt_files:
-        # Use the earliest checkpoint (by modification time) (last checkpoint is also saved)
-        latest_ckpt = min(ckpt_files, key=os.path.getmtime)
-        print(f"Found checkpoint: {latest_ckpt}")
-    else:
-        print("No checkpoint found.")
+ # --------------------------------------------------------------------------------------------------------------
+    # Preparing predictions, ground truth, and climatology for evaluations and plotting
+    # --------------------------------------------------------------------------------------------------------------
 
-    
-    #load model from checkpoint
-    model = HMModule.load_from_checkpoint(latest_ckpt, **config["model"], 
-                                          num_input_features=twsa_sequence_data.num_features,
-                                          num_ocean_features=twsa_sequence_data.num_ocean_features,
-                                            sequence_length=twsa_sequence_data.input_seq_len,
-                                            output_seq_len=twsa_sequence_data.target_seq_len, 
-                                            land_sea_mask=None,
-                                            map_location=f'cuda:{gpu}')
-   
+    climatology = get_climatology(twsa_sequence_data, config)
+     # get list of length num_batches, each element is a tuple of (y_hat, y_true, input_features)
+    predictions = get_predictions(twsa_sequence_data, trainer, config, dataset=dataset, gpu=gpu)
+    time_period = twsa_sequence_data.data_pred.time_period
 
-    model.model_summary()
+    sample_indices = twsa_sequence_data.data_pred.samples
+    timesteps = twsa_sequence_data.data_pred.ds_timeslice.time.values[sample_indices]
 
-   
+    num_nodes = twsa_sequence_data.data_pred.num_land_nodes() 
+    # get mask to mask antarctica out in the evaluation
+    antarctica_mask =  (~twsa_sequence_data.get_antarctica_landmask())
+
+
+    # iterate over the batches in the predictions for the evaluations
+    output_seq_len = config['datamodule']['output_seq_len']
+    twsa_pred = torch.cat([batch[0].reshape(-1, num_nodes, output_seq_len) for batch in predictions], dim=0)[:, antarctica_mask] # [Total_B, N, T]
+    twsa_true = torch.cat([batch[1].reshape(-1, num_nodes, output_seq_len) for batch in predictions], dim=0)[:, antarctica_mask] # [Total_B, N, T]
+    months_input_sequences = torch.cat([recover_month_index(batch[2]['grid'].x[:, :,-1], batch[2]['grid'].x[:, :,-2]).reshape(-1, num_nodes, 12) for batch in predictions], dim=0)[:,antarctica_mask]  # [Total_B, N, T]
+    months_output_sequences = get_months_output_sequences(months_input_sequences, output_seq_len)  # [Total_B, N, T]
+    # mask antarctica out of climatology as well
+    climatology = climatology[:,antarctica_mask]  # [12, N]
         
-
-
- # --------------------------------------------------------------------------------------------------------------
- # Generate predictions
- # --------------------------------------------------------------------------------------------------------------
-    if dataset == "test":
-        dataloader_pred = twsa_sequence_data.predict_dataloader(period=twsa_sequence_data.train_val_test_periods['test'])
-        twsa_sequence_data.setup(stage='test')
-        sample_indices = twsa_sequence_data.data_test.samples
-        timesteps = twsa_sequence_data.data_test.ds_timeslice.time.values[sample_indices]
-        # dataloader_pred = twsa_sequence_data.predict_dataloader(period=twsa_sequence_data.train_val_test_periods['grace'])
-    elif dataset == "val":
-        dataloader_pred = twsa_sequence_data.predict_dataloader(period=twsa_sequence_data.train_val_test_periods['val'])
-        # dataloader_pred = twsa_sequence_data.predict_dataloader(period=twsa_sequence_data.train_val_test_periods['grace'])
-    elif dataset == "train":
-        dataloader_pred = twsa_sequence_data.predict_dataloader(period=twsa_sequence_data.train_val_test_periods['train'])
-
-    elif dataset == "grace":
-        dataloader_pred = twsa_sequence_data.GRACE_dataloader(stage='test')
-        # save time steps in file
-
-        sample_indices = twsa_sequence_data.data_pred.samples
-        timesteps = twsa_sequence_data.data_pred.ds_timeslice.time.values[sample_indices]
-        ts_df = pd.DataFrame(timesteps)
-        ts_df.to_csv(os.path.join(config["experiment"]["save_dir"],"forecast_timesteps.csv"))
-
-    try:
-        predictions = torch.load(os.path.join(config["experiment"]["save_dir"],"predictions.pt"))
-    except FileNotFoundError:
-        trainer.test(model, twsa_sequence_data) # or trainer.datamodule = twsa_sequence_data ??
-        # test before prediction important so trainer has access to datamodules unnormalization during prediction
-
-        predictions = trainer.predict(model, dataloader_pred) # predict usually selects val time period
-        torch.save(predictions, os.path.join(config["experiment"]["save_dir"],"predictions.pt"))
-
-
-     # --------------------------------------------------------------------------------------------------------------
- # Get climatology
- # --------------------------------------------------------------------------------------------------------------
-     
-    try: 
-        climatology = torch.load(os.path.join(config["experiment"]["save_dir"],f"climatology_{dataset}.pt"))
-    except FileNotFoundError:
-        if dataset == 'grace':
-            # makes data_train be GRACE data
-            dl = twsa_sequence_data.GRACE_dataloader(stage='fit', train_split=1.0)
-        twsa_train = twsa_sequence_data.unnormalize_twsa(twsa_sequence_data.data_train.ds_timeslice['twsa'])
-        climatology = compute_climatology(twsa_train, 
-                                            twsa_sequence_data.data_train.land_ocean_mask)
-        print('Climatology time period:' , twsa_sequence_data.data_train.time_period)
-        torch.save(climatology, os.path.join(config["experiment"]["save_dir"],f"climatology_{dataset}.pt"))
-
     
    
     time_period = twsa_sequence_data.data_pred.time_period
@@ -547,40 +499,11 @@ def evaluate(experiment_path, gpu, dataset="test"):
     antarctica_mask =  (~twsa_sequence_data.get_antarctica_landmask())
     climatology = climatology[:,antarctica_mask]  # [12, N]
 
+    
+    pred_basin_mean, true_basin_mean, basin_mean_climatology, pred_months, basin_ids = get_basin_wide_mean_twsa(twsa_pred, twsa_true, climatology, months_output_sequences, twsa_sequence_data)
 
-    # iterate over the batches in the predictions for the evaluations
-    twsa_pred = [batch[0].reshape(-1, num_nodes, output_seq_len) for batch in predictions]
-    twsa_true = [batch[1].reshape(-1, num_nodes, output_seq_len) for batch in predictions]
-    months_input_sequences = [recover_month_index(batch[2]['grid'].x[:, :,-1], batch[2]['grid'].x[:, :,-2]).reshape(-1, num_nodes, 12) for batch in predictions]
 
-    twsa_pred = torch.cat(twsa_pred, dim=0)[:, antarctica_mask]  # [Total_B, N, T]
-    twsa_true = torch.cat(twsa_true, dim=0)[:, antarctica_mask]  # [Total_B, N, T]
-    months_input_sequences = torch.cat(months_input_sequences, dim=0)[:,antarctica_mask]  # [Total_B, N, T]
-    
-    months_output_sequences = [(months_input_sequences[:,:, -1] +i +1)%12 for i in range(output_seq_len)]
-    months_output_sequences = torch.stack([(months_input_sequences[:,:, -1] +i +1)%12 for i in range(output_seq_len)])  # [horizon, Total_B, N]
-    months_output_sequences = months_output_sequences.permute(1,2,0)  # [Total_B, N, horizon]
-    
-    # calculate basin wise mean TWSA for each prediction sequence
-    pred_basin_mean = []
-    true_basin_mean = []
-    basin_mean_climatology = []
-    pred_month = []
-    
-    for (pred, true, months) in zip(twsa_pred, twsa_true, months_output_sequences):
-        pred, true, basin_clim, basin_ids = basin_wide_mean_twsa(pred.permute(1,0),
-                                                                  true.permute(1,0), 
-                                                                  climatology[months[0]], 
-                                                                   twsa_sequence_data)
-        pred_basin_mean.append(pred)
-        true_basin_mean.append(true)
-        basin_mean_climatology.append(basin_clim)
-        pred_month.append(months[0])
-    pred_basin_mean = np.stack(pred_basin_mean)  # [B, T (horizon), N_basins]
-    true_basin_mean = np.stack(true_basin_mean)  # [B, T(horizon), N_basins]
-    basin_mean_climatology = np.stack(basin_mean_climatology)  # [B, T(horizon), N_basins]
-    pred_months = np.stack(pred_month)  # [B, T(horizon)]
-    
+
      # get climatology for the predicted months
     clim_pred = torch.Tensor(climatology[pred_months])
     
@@ -714,7 +637,7 @@ def evaluate(experiment_path, gpu, dataset="test"):
         if i in [0,4,8,12]:
             ax.set_ylabel('TWSA [cm]', fontsize=fontsize)
         ax.tick_params(axis='both', which='major', labelsize=fontsize)
-    # ax.legend(loc='best', fontsize=12)
+
     handles, labels = ax.get_legend_handles_labels()
     legend_ax = fig.add_axes([0.6, 0.05, 0.2, 0.02]) 
     legend_ax.axis("off")
@@ -736,7 +659,6 @@ def evaluate(experiment_path, gpu, dataset="test"):
     plt.tight_layout(rect=[0, 0.1, 1, 1])
     plt.savefig(os.path.join(config["experiment"]["save_dir"], 
                                                       f'BasinPlots/All_Basins.png'), dpi=300)
-        # test_basin_per_timestep_scores = [{f'{name}': metric(torch.Tensor(pred), torch.Tensor(true)).mean(dim=0) for name, metric in metrics_dict.items()}][0]
 
     # -----------------------------------------------------------
     # plot differnet time period

@@ -1,23 +1,11 @@
 
-import xarray as xr
-from tqdm import tqdm
-from torch.utils.data import Dataset
-from pathlib import Path
 import numpy as np
 import torch
-
-import random
-import time
-from tqdm import tqdm
 import warnings
+import xarray as xr
 
-def datetime2float(time_values):
-    return (time_values - np.datetime64('1979-07-01T00:00:00')) / np.timedelta64(1, 'M')
+from torch.utils.data import Dataset
 
-
-
-
-        
 
 # create cell dataset
 class TWSA2DDataset(Dataset):
@@ -60,14 +48,12 @@ class TWSA2DDataset(Dataset):
         
         self.features = torch.Tensor(np.stack([self.ds_timeslice[var].to_numpy() for var in self.input_vars], axis=1))
         self.target_id = self.input_vars.index(self.target)
-        #self.df = self.ds_timeslice.to_dataframe().reset_index().set_index(['time'])
-        # self.features, self.targets, self.positions = self.prepare_samples()
+
         
-        # print(self.features.shape)
+
 
     def get_sample_indices(self):
         feature_indices_list = []
-        #import pdb; pdb.set_trace()
 
         if self.time_step is not None:
             # this is for inference when we only want to predict one time step
@@ -87,30 +73,6 @@ class TWSA2DDataset(Dataset):
         return feature_indices_list
 
 
-    def normalize_ds_timeslice_1D(self):       
-        # normalize input variables 
-        mask_land =  self.land_ocean_mask # 1 is land and 0 is ocean
-        mask_ocean =  self.ds_timeslice['lsm'].values==0
-           
-        if self.scaling_params is not None:
-            self.ds_timeslice = self.ds_timeslice.fillna(self.features_nanfill)
-            for i, var in enumerate(self.input_vars):
-                assert var == self.scaling_params[i][0].name
-                assert var == self.scaling_params[i][1].name
-
-                self.ds_timeslice[var] = (self.ds_timeslice[var] - self.scaling_params[i][0]) / self.scaling_params[i][1]
-                
-                if var in self.land_variables:
-                    mask = mask_land
-                elif var in self.ocean_variables:
-                    mask = mask_ocean
-                elif var== 'twsa':
-                    mask = (self.mask_not_antarctica & mask_land)
-                else:
-                    mask = np.ones_like(mask_land).astype('bool')
-                self.ds_timeslice[var].values[~mask] = 0 #self.ds_timeslice[var].where(~mask, 0).fillna(self.features_nanfill)                
-                self.ds_timeslice[var] = self.ds_timeslice[var].fillna(self.features_nanfill)
-   
     def normalize_ds_timeslice(self):
         mask_land =  self.land_ocean_mask # 1 is land and 0 is ocean
         mask_ocean =  self.ds_timeslice['lsm'].values==0
@@ -204,61 +166,17 @@ class TWSA2DDataset(Dataset):
     def __getitem__(self, idx):
         # get sample
         t = self.samples[idx]
-        # get local input
-        #timeslice_input_ds = self.ds_timeslice.isel(time=slice(t-self.input_seq_len, t))
-
         input_features = self.features[t-self.input_seq_len:t] # shape [<input_seq_len, num_vars, h, w>]
-        #local_input = np.stack([timeslice_input_ds[var].to_numpy() for var in self.input_vars], axis=1)
-        
-        
-        # local_pos = np.stack([local_input_ds[var].values for var in self.positional_vars], axis=0)
-        #local_input = np.nan_to_num(local_input, nan=self.features_nanfill)
         # get target
         pred_start = t + self.delay
         pred_end = t + self.delay + self.pred_len
         target = self.features[pred_start:pred_end][:, self.target_id] 
-        # local_target = self.ds_timeslice.isel(time=slice(pred_start, pred_end))[self.target].values
-
-        # local_target = np.squeeze(local_target)
-        # mask = self.land_mask[pred_start:pred_end] & self.mask_not_antarctica[pred_start:pred_end] # mask for land and not antarctica
-        
         mask = self.land_ocean_mask[t] & self.mask_not_antarctica[t] # mask for land and not antarctica
         
         return {
-            # x_sequence has shape (1, timesteps, features, h, w)
-            'x_sequence': input_features,            
-            # y_local has shape (1, timesteps, h, w)
+            'x_sequence': input_features,
             'y_timestep': target,
             'land_mask': torch.Tensor(mask)
         }
 
 
-
-if __name__ == '__main__':
-    path= "data/twsa_rec_era5_global_1deg_detrend.nc" #SeasFireCube_v3_1deg
-    ds=xr.open_dataset(path)
-    # ds = ds.rename({"lat": "latitude", "lon": "longitude"})
-    print("data loaded")
-    input_vars =   ['t2m_mean','tp','vpd']
-    log_transform_vars = []
-    total_time_steps = len(ds.time)
-    train_time_steps = int(total_time_steps * 0.6)
-    val_time_steps = int(total_time_steps * 0.2)
-    time_period= (ds.time[0].values, ds.time[3].values)
-    
-    seq_len = 1
-    output_seq_len = 1
-    dataset = TWSA2DDataset(ds, 
-                            time_period, 
-                            target='twsa', 
-                            delay=12, 
-                            input_seq_len=12, 
-                            time_step=None,
-                            )
-    import matplotlib.pyplot as plt
-    import pdb; pdb.set_trace()
-    dataset.ds_timeslice.twsa.max(dim=['lon', 'lat']).plot(label='max')
-    dataset.ds_timeslice.twsa.min(dim=['lon', 'lat']).plot(label='min')
-    plt.legend()
-    plt.savefig('twsa_max_min_detrend_norm.png')
-    plt.close()

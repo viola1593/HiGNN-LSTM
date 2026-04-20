@@ -8,6 +8,7 @@ import numpy as np
 import os
 import pandas as pd
 import pytorch_lightning as pl
+
 import torch
 import torchmetrics
 from typing import Any, Dict
@@ -15,9 +16,8 @@ import xarray as xr
 import yaml
 
 
-from datamodules.TWSA_datamodule2D import TWSA_Datamodule2D_new
+from datamodules.TWSA_datamodule2D import TWSA_Datamodule2D
 from losses.kge import KGE
-from losses.utils_for_nans import mean_with_nans, median_with_nans
 from models.pl_convlstm import ConvLSTMModule
 
 
@@ -51,8 +51,7 @@ def generate_trainer(config: Dict[str, Any]) -> pl.Trainer:
     return pl.Trainer(
         **config["pl"],
         default_root_dir=config["experiment"]["save_dir"],
-        #logger=loggers,
-        #callbacks=[early_stopping_callback]
+
         )
 
 
@@ -65,52 +64,21 @@ def create_experiment_dir(config: Dict[str, Any], experiment_path) -> str:
     Returns:
         config with updated save_dir
     """
-    #os.makedirs(config["experiment"]["exp_dir"], exist_ok=True)
     exp_dir_path = os.path.join(f"eval_on_test", experiment_path)
     os.makedirs(exp_dir_path, exist_ok=True)
-    # os.makedirs(os.path.join(exp_dir_path, "SSIM"), exist_ok=True)
-    # os.makedirs(os.path.join(exp_dir_path, "ExpVar"), exist_ok=True)
-    # os.makedirs(os.path.join(exp_dir_path, "KGE"), exist_ok=True)
-    # os.makedirs(os.path.join(exp_dir_path, "BasinPlots"), exist_ok=True)
-    # os.makedirs(os.path.join(exp_dir_path, "Predictions"), exist_ok=True)
-    # os.makedirs(os.path.join(exp_dir_path, "NSE"), exist_ok=True)
-    # os.makedirs(os.path.join(exp_dir_path, "RMSE"), exist_ok=True)
     config["experiment"]["save_dir"] = exp_dir_path
     
     return config
 
-def plot_adj_mat(adj, save_dir=None):
-    plt.imshow(adj, cmap='Reds')
-    plt.colorbar()
-    plt.savefig(save_dir)
-    plt.close()
-
-def plot_pixel_adj_mat(adj, data_lonlat, save_dir=None):
-    plt.scatter(data_lonlat[:,0], data_lonlat[:,1], c=adj, cmap='viridis', s=1)
-    plt.colorbar()
-    plt.savefig(save_dir)
-    plt.close()
-
 def plot_prediction(y_hat, y_true, datamodule, antarctica=None, save_dir=None, title='TWSA Prediction (Test Set)'):
-    #lon, lat = datamodule.data_pred.land[0][:,0], datamodule.data_pred.land[0][:,1]
-
-    # if antarctica is not None:
-    #     antarctica_mask =  datamodule.get_landmask_without_antarctica()
-    #     lon = lon[antarctica_mask]
-    #     lat = lat[antarctica_mask]
 
     vmax = 100
     f, ( ax1, ax2, ax3) = plt.subplots(3,1,figsize=(5,10))
-    # p0 = ax0.imshow(y_last, cmap='coolwarm',  vmin=-vmax, vmax=vmax)
     p1 = ax1.imshow(y_hat, cmap='coolwarm', vmin=-vmax, vmax=vmax)
     p2 = ax2.imshow(y_true, cmap='coolwarm', vmin=-vmax, vmax=vmax)
     ape = abs(y_hat-y_true)/(abs(y_true)+ 1e-5) * 100
     p3 = ax3.imshow(ape, cmap='Reds', vmin=0, vmax=100)
-    #p3 = ax3.imshow(abs(y_hat-y_true)/(y_true+ 1e-5), cmap='Reds', vmin=0, vmax=1)
-    # ax0.set_title('Last TWSA')
-    # ax1.set_title('Predicted TWSA')
-    # ax2.set_title('True TWSA')
-    # ax3.set_title('Absolute Difference')
+
     f.suptitle(title)
     format_global_plot(ax1, noticks_x=True, noticks_y=True)
     format_global_plot(ax2, noticks_x=True, noticks_y=True)
@@ -147,7 +115,6 @@ def format_global_plot(ax, noticks_x=False, noticks_y=False):
 
 def plot_NSE_or_KGE(nse, datamodule, title='NSE', save_dir=None, vmin=0):
     land_mask = (datamodule.get_landmask_without_antarctica() & datamodule.data_train.land_ocean_mask[0])
-    # x, y = datamodule.data_pred.land[0][:,0][land_mask], datamodule.data_pred.land[0][:,1][land_mask]
     f, ax0 = plt.subplots(1,1, figsize=(5,4))
     # -0.41 everything below is worse than a mean prediction for each time step
     cmap = plt.cm.Reds.reversed()
@@ -165,11 +132,7 @@ def plot_NSE_or_KGE(nse, datamodule, title='NSE', save_dir=None, vmin=0):
     plt.close()
 
 def plot_KGE(kge, datamodule, save_dir=None):
-    
-   
     land_mask = (datamodule.get_landmask_without_antarctica() & datamodule.data_train.land_ocean_mask[0])
-
-
     f, ((ax0, ax1), (ax2, ax3)) = plt.subplots(2,2, figsize=(20,10))
     # -0.41 everything below is worse than a mean prediction for each time step
     p0 = ax0.imshow(kge[0],   vmin=-0.41)
@@ -204,30 +167,6 @@ def plot_KGE(kge, datamodule, save_dir=None):
     plt.savefig(save_dir)
     plt.close()
 
-def calculate_plot_kge_per_pixel(validation_step_outputs, datamodule=None, save_dir=None):
-    #twsa_mean, twsa_std = datamodule.scaling_mean_std[0]
-    y_hat, y_true = zip(*validation_step_outputs)
-    y_hat = torch.cat(y_hat, dim=0) #*torch.Tensor(twsa_std.values) + torch.Tensor(twsa_mean.values)
-    y_true = torch.cat(y_true, dim=0) #*torch.Tensor(twsa_std.values) + torch.Tensor(twsa_mean.values)
-    
-    kge_list = []
-    # for every element in the batch
-    for pred, true in zip(y_hat, y_true):
-        kge = KGE(pred, true).cpu()
-        kge_list.append(kge)
-    #calculate the mean KGE over the batch
-    pixel_kge = torch.stack(kge_list).mean(axis=0)
-
-    # print(y_hat.shape, y_true.shape)
-
-    # kge=KGE(y_hat, y_true).cpu()
-    
-    print('KGE, correlation', kge[:2])
-    plot_KGE(pixel_kge, datamodule, save_dir=save_dir)
-    return {'kge': mean_with_nans(pixel_kge[0]).cpu().tolist(), 'corr': mean_with_nans(pixel_kge[1]).cpu().tolist(), 
-            'alpha': mean_with_nans(pixel_kge[2]).cpu().tolist(), 'beta': mean_with_nans(pixel_kge[3]).cpu().tolist(), 
-            'kge_meadian':median_with_nans(pixel_kge[0]).cpu().tolist()}
-
 def plot_ssim(y_pred, y_true, datamodule, index, antarctica_mask=None, climatology=None, save_dir=None, f=None, ax=None):
     """Calculate the Structural Similarity Index (SSIM) between two tensors.
     y_pred: predicted values, shape [T, N]
@@ -236,16 +175,12 @@ def plot_ssim(y_pred, y_true, datamodule, index, antarctica_mask=None, climatolo
 
 
     ssim_metric = torchmetrics.image.StructuralSimilarityIndexMeasure(reduction='none')
-    # import pdb; pdb.set_trace()
     y_pred = y_pred.unsqueeze(1)
     y_true = y_true.unsqueeze(1)
     # compute SSIM for the current time step
     ssim = ssim_metric(y_pred, y_true)
     ssim_zeros = ssim_metric(torch.zeros(y_true.shape), y_true)
-    
-
     if climatology is not None:
-
         ssim_clim = ssim_metric(torch.Tensor(climatology).unsqueeze(1), y_true)
     else: ssim_clim = None
 
@@ -408,9 +343,11 @@ def evaluate(experiment_path, gpu):
     # generate trainer
     trainer = generate_trainer(config)
 
-    twsa_sequence_data = TWSA_Datamodule2D_new(**config['datamodule'])
+    twsa_sequence_data = TWSA_Datamodule2D(**config['datamodule'])
     twsa_sequence_data.setup(stage='fit')
     output_seq_len = config['datamodule']['output_seq_len']
+    trainer.datamodule = twsa_sequence_data # assign datamodule to trainer for prediction
+
     
 
     # Recursively search for .ckpt files in all subfolders
@@ -433,7 +370,6 @@ def evaluate(experiment_path, gpu):
     
     from pytorch_lightning.utilities.model_summary import ModelSummary
     print(ModelSummary(model))
-    # import pdb; pdb.set_trace()     
 
  # --------------------------------------------------------------------------------------------------------------
  # Validation scores
@@ -462,8 +398,6 @@ def evaluate(experiment_path, gpu):
         climatology = compute_climatology(twsa_train, lsm=twsa_sequence_data.data_train.ds_timeslice['lsm'])
         torch.save(climatology, os.path.join(config["experiment"]["save_dir"],"climatology.pt"))
 
-    # import pdb; pdb.set_trace()
-    
     # get mask to mask antarctica out in the evaluation
     antarctica_mask =  twsa_sequence_data.get_landmask_without_antarctica()
     #climatology = climatology[:,antarctica_mask]  # [12, N]

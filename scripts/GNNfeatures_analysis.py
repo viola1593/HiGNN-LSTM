@@ -24,8 +24,8 @@ import matplotlib.pyplot as plt
 import seaborn as sns
 from typing import Dict, Tuple, Any
 
-from captum.attr import DeepLiftShap
-from captum.attr import IntegratedGradients, Saliency, NoiseTunnel
+
+from captum.attr import Saliency, NoiseTunnel
 from models.pl_hmmodel import HMModule
 from datamodules.TWSA_heterograph_datamodule import TWSA_HeteroGraphDatamodule
 
@@ -71,28 +71,12 @@ class RNNWrapper(torch.nn.Module):
     def __init__(self, model, horizon_step):
         super().__init__()
         self.model = model
-        # self.twsa_history_fixed = twsa_history_fixed  # [batch, seq_len, 1]
-        # self.timestep_embed = timestep_embed            # [batch, seq_len, hidden_dim]
         self.horizon_step = horizon_step
     
     def forward(self, input_ts):
        
         actual_batch = input_ts.shape[0]  # n_steps*batch during IG
-        # orig_batch = self.twsa_history_fixed.shape[0]
-        # repeat_factor = actual_batch // orig_batch  # = n_steps
-        
-        # # Tile along dim 0 instead of expand
-        # twsa_tiled = self.twsa_history_fixed.repeat(repeat_factor, 1, 1)  # [n_steps*batch, seq_len, 1]
-        
-        # timestep_tiled = self.timestep_embed.unsqueeze(0).unsqueeze(0).repeat(
-        #     actual_batch, self.model.seq_len, 1
-        # )  # [n_steps*batch, seq_len, hidden_dim]
-        
-        # input_ts = torch.cat([
-        #     timestep_tiled,
-        #     twsa_tiled,
-        #     input_ts
-        # ], dim=-1)
+
         
         h0 = torch.zeros(self.model.rnn_layers, actual_batch, self.model.rnn_hidden_size).to(input_ts.device)
         c0 = torch.zeros(self.model.rnn_layers, actual_batch, self.model.rnn_hidden_size).to(input_ts.device)
@@ -169,26 +153,10 @@ def compute_gnn_latent_importance(model, data, n_steps=25):
             stdevs=stdevs_gnn,
             abs=False                   # keep sign, take abs later
         )
-        # attribution = ig.attribute(
-        #     input_ts,
-        #     baselines=baseline,
-        #     n_steps=n_steps,          # 50 is usually enough, lower = cheaper
-        #     method='gausslegendre'     # more stable than riemann
-        # )
-        # Aggregate over batch and seq_len immediately to save memory
+
         
         all_attributions.append(attribution.abs().mean(dim=[0,1]).cpu())
         print(f"Horizon step {i+1}/{model.horizon} done")
-        # Completeness check for IG
-        # pred_input = wrapper(input_ts)
-        # pred_baseline = wrapper(baseline)
-        # attr_sum = attribution.sum()
-        # expected_diff = (pred_input - pred_baseline).sum()
-
-        # print(f"Attribution sum:  {attr_sum:.4f}")
-        # print(f"Expected diff:    {expected_diff:.4f}")
-        # rel_error = (attr_sum - expected_diff).abs() / expected_diff.abs()
-        # print(f"Relative Error:           {rel_error:.2%}")
         
         
         del attribution #, pred_input, pred_baseline, attr_sum, expected_diff
@@ -690,8 +658,7 @@ def main(args):
     else:
         attr_dict = compute_attributions_over_dataset(model.model, datamodule.val_dataloader(),
                                               n_steps=10, device=device)
-    # attributions = compute_gnn_latent_importance(model.model, data_batch, n_steps=20)
-    # results = summarize_attributions(attributions)
+
         attr_gnn_cpu      = attr_dict['gnn_attr_mean'].cpu().float()
         attr_twsa_cpu     = attr_dict['twsa_attr_mean'].cpu().float()
         attr_timestep_cpu = attr_dict['timestep_attr_mean'].cpu().float()
@@ -728,10 +695,6 @@ def main(args):
                          save_path=os.path.join(output_dir, 'smoothgrad_attrs_valdataset1.png'))
 
 
-    # Top 10 most important GNN embedding dims
-    # top_dims = results['dim_importance'].topk(4)
-    # print("Most important GNN latent dims:", top_dims.indices)
-    # print("Their importance scores:", top_dims.values)
     
     
     

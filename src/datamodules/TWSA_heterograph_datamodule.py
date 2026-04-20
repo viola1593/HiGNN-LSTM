@@ -1,7 +1,7 @@
 from typing import Optional, Tuple, Dict
 import torch
 from pytorch_lightning import LightningDataModule
-from torch.utils.data import  DataLoader, Dataset
+from torch.utils.data import  Dataset
 from torch_geometric.loader import DataLoader as pygDataLoader
 
 import numpy as np
@@ -9,47 +9,10 @@ import xarray as xr
 
 import matplotlib.pyplot as plt
 try:
-    from datamodules.TWSA_heterograph_dataset import TWSAGraphHeteroData, DummyDataset
+    from datamodules.TWSA_heterograph_dataset import TWSAGraphHeteroData
 except ModuleNotFoundError:
-    from TWSA_heterograph_dataset import TWSAGraphHeteroData, DummyDataset
+    from TWSA_heterograph_dataset import TWSAGraphHeteroData
 
-class MultiEpochsDataLoader(torch.utils.data.DataLoader):
-
-    def __init__(self, *args, **kwargs):
-        super().__init__(*args, **kwargs)
-        self._DataLoader__initialized = False
-        self.batch_sampler = _RepeatSampler(self.batch_sampler)
-        self._DataLoader__initialized = True
-        self.iterator = super().__iter__()
-
-    def __len__(self):
-        return len(self.batch_sampler.sampler)
-
-    def __iter__(self):
-        for i in range(len(self)):
-            yield next(self.iterator)
-
-
-class _RepeatSampler(object):
-    """ Sampler that repeats forever.
-    Args:
-        sampler (Sampler)
-    """
-
-    def __init__(self, sampler):
-        self.sampler = sampler
-
-    def __iter__(self):
-        while True:
-            yield from iter(self.sampler)
-
-def collate_fn(batch):
-  
-  return {
-      'x_sequence': torch.stack([x['x_sequence'] for x in batch]),
-      'y_timestep': torch.stack([x['y_timestep'] for x in batch]),
-      'edge_index': torch.stack([x['edge_index'] for x in batch]),
-}
 
 
 
@@ -171,13 +134,9 @@ class TWSA_HeteroGraphDatamodule(LightningDataModule):
                 
                 self.scaling_mean_std = self.data_train.scaling_params
                 self.ocean_clustering = self.data_train.ocean_clustering
-                #self.land_clustering = self.data_train.land_clustering
+
                 
 
-            # Save mean std dict for normalization during inference time
-            #print("Mean", self.mean_std_dict)
-            #with open(f'mean_std_dict_{self.target_shift}.json', 'w') as f:
-            #    f.write(json.dumps(self.mean_std_dict))
 
         
             # load datasets only if they're not loaded already
@@ -185,7 +144,6 @@ class TWSA_HeteroGraphDatamodule(LightningDataModule):
                 print("Scaling data for prediction with scaling mean std derived from training data")
                 self.data_val = TWSAGraphHeteroData(self.ds.copy(), time_period=self.train_val_test_periods['val'],
                                                     ocean_clustering=self.ocean_clustering,
-                                                    #land_clustering=self.land_clustering,
                                                     target='twsa', 
                                                     delay_time=self.delay, 
                                                     input_seq_len=self.input_seq_len,
@@ -205,7 +163,6 @@ class TWSA_HeteroGraphDatamodule(LightningDataModule):
                     print("Mean and std not found, scaling data for validation with scaling mean std derived from validation data")
                 self.data_val = TWSAGraphHeteroData(self.ds.copy(), time_period=self.train_val_test_periods['val'],
                                                     ocean_clustering=self.ocean_clustering,
-                                                    #land_clustering=self.land_clustering,
                                                     target='twsa', 
                                                     delay_time=self.delay, 
                                                     input_seq_len=self.input_seq_len,
@@ -227,7 +184,6 @@ class TWSA_HeteroGraphDatamodule(LightningDataModule):
                     print("Mean and std not found, scaling data for test with scaling mean std derived from test data")
                 self.data_test = TWSAGraphHeteroData(self.ds.copy(), time_period=self.train_val_test_periods['test'],
                                                     ocean_clustering=self.ocean_clustering,
-                                                    #land_clustering=self.land_clustering,
                                                     target='twsa', 
                                                     delay_time=self.delay, 
                                                     input_seq_len=self.input_seq_len,
@@ -324,14 +280,11 @@ class TWSA_HeteroGraphDatamodule(LightningDataModule):
             return None
 
     def train_dataloader(self):
-        #print(self.hparams.batch_size)
         return pygDataLoader(
             dataset=self.data_train,
             batch_size=self.hparams.batch_size,
             num_workers=self.hparams.num_workers,
-            #pin_memory=self.hparams.pin_memory,
             shuffle=True,
-            # persistent_workers=True,
             drop_last=False
             
         )
@@ -341,9 +294,7 @@ class TWSA_HeteroGraphDatamodule(LightningDataModule):
             dataset=self.data_val,
             batch_size=self.hparams.batch_size,
             num_workers=self.hparams.num_workers,
-            #pin_memory=self.hparams.pin_memory,
             shuffle=False,
-            # persistent_workers=True,
             drop_last=False,
             
         )
@@ -353,9 +304,7 @@ class TWSA_HeteroGraphDatamodule(LightningDataModule):
             dataset=self.data_test,
             batch_size=self.hparams.batch_size,
             num_workers=self.hparams.num_workers,
-            #pin_memory=self.hparams.pin_memory,
             shuffle=False,
-            # persistent_workers=True,
             drop_last=False,
             
         )
@@ -367,7 +316,6 @@ class TWSA_HeteroGraphDatamodule(LightningDataModule):
             print("Mean and std not found, scaling data for prediction with scaling mean std derived from prediction dataset")
         self.data_pred = TWSAGraphHeteroData(self.ds.copy(), time_period=period, time_step=time_step_idx,
                                                     ocean_clustering=self.ocean_clustering,
-                                                    #land_clustering=self.land_clustering,
                                                     target='twsa', 
                                                     delay_time=self.delay, 
                                                     input_seq_len=self.input_seq_len,
@@ -383,21 +331,17 @@ class TWSA_HeteroGraphDatamodule(LightningDataModule):
         return pygDataLoader(dataset=self.data_pred,
                     batch_size=self.hparams.batch_size,
                     num_workers=self.hparams.num_workers,
-                    #pin_memory=self.hparams.pin_memory,
                     shuffle=False,
-                    # persistent_workers=True,
                     drop_last=False,
             )
     
-    def GRACE_dataloader(self, stage='test', time_step_idx: int=None, train_split: float=0.9):
+    def GRACE_dataloader(self, stage='test', time_step_idx: int=None):
         """Dataloader that gets the dataset with GRACE-derived TWSA instead of the reconstructed TWSA"""
         grace_dataset = xr.open_dataset('data/latest_data/GRACE_era5_1deg_detrend_latavg_tempmatch.nc')
         
         if 'detrended_twsa' in grace_dataset.data_vars.keys():
             grace_dataset = grace_dataset.rename({"detrended_twsa":"twsa"}) # make sure naming conventions are consistent
-        # get the dataset 
-        
-        # grace_dataset = grace_dataset.drop_vars(['time_bounds', 'lwe_thickness'])
+    
         if grace_dataset['lat'][0] < grace_dataset['lat'][-1]:
             grace_dataset = grace_dataset.sortby('lat', ascending=False)
         
@@ -413,10 +357,9 @@ class TWSA_HeteroGraphDatamodule(LightningDataModule):
         
         
         if stage == 'test':
-            # choose time slice that has monthly data without gaps (2018-11-16 to 2023-11-16) (GRACE-FO) 166:-1
-            #30:101
+            # choose time slice that has no overlap with training dataset (2008-03 to 2023-11-16)  
             time_period = (self.data_train.time_period[-1], grace_dataset.time[-1].values) 
-            # time_period = (grace_dataset.time[0].values, grace_dataset.time[-1].values) 
+            # data gaps will be handled by the dataset class
             self.data_pred = TWSAGraphHeteroData(grace_dataset, time_period=time_period, time_step=time_step_idx,
                                                     ocean_clustering=self.ocean_clustering,
                                                     target='twsa', 
@@ -437,132 +380,6 @@ class TWSA_HeteroGraphDatamodule(LightningDataModule):
                     shuffle=False,
                     drop_last=False)
         
-        elif stage == 'fit':
-            time_period = (grace_dataset.time.values[0], self.data_train.time_period[-1]) 
-            # check how many samples we can get
-            sequence_counter = 0
-            index_list =[]
-            for i, start_time in enumerate(grace_dataset.time.values):
-                end_time = start_time.astype('datetime64[M]') + np.timedelta64(self.input_seq_len + self.delay + self.target_seq_len+ self.delay-1, 'M')
-                if end_time > time_period[1]:
-                    break
-                else: 
-                    sequence = grace_dataset.sel(time=slice(start_time, end_time))
-                    if sequence.time.shape[0] < self.input_seq_len + self.delay + self.target_seq_len:
-                        continue
-                    elif sequence.time[-1]  == sequence.time[0].values.astype('datetime64[M]') + np.timedelta64(self.input_seq_len + self.delay + self.target_seq_len-1, 'M'):
-                        # print(f"Found sequence from {start_time} to {end_time} with {sequence.time.shape[0]} time steps")
-                        sequence_counter += 1
-                        index_list.append(i)
-            last_train_index=index_list[int(len(index_list)*train_split)-1]
 
 
-            train_period = (time_period[0], grace_dataset.time[last_train_index].values)  # mostly GRACE
 
-            
-            self.data_train = TWSAGraphHeteroData(grace_dataset, time_period=train_period, time_step=time_step_idx,
-                                                    ocean_clustering=self.ocean_clustering,
-                                                    target='twsa', 
-                                                    delay_time=self.delay, 
-                                                    input_seq_len=self.input_seq_len,
-                                                    output_seq_len=self.target_seq_len,
-                                                    k_mesh2mesh=self.k_mesh2mesh, 
-                                                    k_mesh2grid=self.k_mesh2grid,
-                                                    scaling_mean_std=self.scaling_mean_std,
-                                                    land_ocean_mask=self.land_ocean_mask, 
-                                                    features_nanfill=0,
-                                                    graph_path=self.graph_path,
-                                                    num_ocean_clusters=self.num_ocean_clusters,
-                                                    train_val_test_data='grace_train')
-            # self.scaling_mean_std = self.data_train.scaling_params
-            
-            val_period = (grace_dataset.time[last_train_index].values, time_period[1])  
-            self.data_val = TWSAGraphHeteroData(grace_dataset, time_period=val_period, time_step=time_step_idx,
-                                                    ocean_clustering=self.ocean_clustering,
-                                                    target='twsa', 
-                                                    delay_time=self.delay, 
-                                                    input_seq_len=self.input_seq_len,
-                                                    output_seq_len=self.target_seq_len,
-                                                    k_mesh2mesh=self.k_mesh2mesh, 
-                                                    k_mesh2grid=self.k_mesh2grid,
-                                                    scaling_mean_std=self.scaling_mean_std,
-                                                    land_ocean_mask=self.land_ocean_mask, 
-                                                    features_nanfill=0,
-                                                    graph_path=self.graph_path,
-                                                    num_ocean_clusters=self.num_ocean_clusters,
-                                                    train_val_test_data='grace')
-            
-            train_dl = pygDataLoader(dataset=self.data_train,
-                    batch_size=self.hparams.batch_size,
-                    num_workers=self.hparams.num_workers,
-                    shuffle=True,
-                    drop_last=False)
-            val_dl = pygDataLoader(dataset=self.data_val,
-                    batch_size=self.hparams.batch_size,
-                    num_workers=self.hparams.num_workers,
-                    shuffle=False,
-                    drop_last=False)
-            
-            return train_dl, val_dl 
-    
-    
-    
-    def dummy_dataloader(self):
-        self.data_dummy = DummyDataset(self.ds.copy(), time_period=self.train_val_test_periods['test'], time_step=0,
-                                                    ocean_clustering=self.ocean_clustering,
-                                                    target='twsa', 
-                                                    delay_time=self.delay, 
-                                                    input_seq_len=self.input_seq_len,
-                                                    output_seq_len=self.target_seq_len,
-                                                    k_mesh2mesh=self.k_mesh2mesh, 
-                                                    k_mesh2grid=self.k_mesh2grid,
-                                                    scaling_mean_std=self.scaling_mean_std,
-                                                    land_ocean_mask=self.land_ocean_mask, 
-                                                    features_nanfill=0,
-                                                    graph_path=self.graph_path,
-                                                    num_ocean_clusters=self.num_ocean_clusters,
-                                                    train_val_test_data='dummy')
-        return pygDataLoader(dataset=self.data_dummy,
-                    batch_size=self.hparams.batch_size,
-                    num_workers=self.hparams.num_workers,
-                    #pin_memory=self.hparams.pin_memory,
-                    shuffle=False,
-                    # persistent_workers=True,
-                    drop_last=False,
-            )
-
-def float2datetime(float_values):
-    return (float_values *np.timedelta64(1, 'D') + np.datetime64('1970-01-01T00:00:00'))
-# Function to load yaml configuration file
-
-def read_config(config_path):
-    import yaml
-    with open(config_path) as file:
-        config = yaml.safe_load(file)
-
-    return config
-if __name__ == '__main__':
-    config_path = 'configs/config_heterograph.yaml'
-    config = read_config(config_path)
-    datamod = TWSA_HeteroGraphDatamodule(**config['datamodule'])
-    
-    datamod.setup(stage='fit')
-    train_dataloader = datamod.train_dataloader()
-    for b in train_dataloader:
-        print(b[0]['grid'].x)
-    import pdb; pdb.set_trace()
-    grace_dl = datamod.GRACE_dataloader(stage='test')
-    for batch in grace_dl:
-        print(batch[0]['grid'].x)
-
-    for i in range(11):
-        plt.plot(batch[0]['grid'].x[:,:,i])
-        plt.savefig(f'newgrace_x{i}.png')
-        plt.close()
-        plt.plot(b[0]['grid'].x[:,:,i])
-        plt.savefig(f'newtrain_x{i}.png')
-        plt.close()
-    import pdb; pdb.set_trace()
-    feat, label = next(iter(train_dataloader))
-    datamod.setup(stage='validate')
-    datamod.setup(stage='test')

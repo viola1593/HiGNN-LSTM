@@ -33,17 +33,11 @@ datamodule:
   - t2m # 2m temperature
   - si10 # 10 m wind speed
   - tp # total precipitation
-  # - swvl1
-  # - swvl2
-  # - swvl3
-  # - swvl4 #  soil moisture level 1-4
-  # - lai_lv # leaf area index low vegetation
-  # - lai_hv # leaf area index high vegetation
   - lsm # land sea mask
   - e # evaporation
   - ro # runoff
   - pev # potential evaporation
- # - z # geopotential
+
 
 
 

@@ -1,5 +1,4 @@
-import torch 
-import numpy as np
+import torch
 def KGE(y_pred, y_true, land_sea_mask=None):
    '''Kling-Gupta Efficiency adapted from Hallouin, T. (XXXX). HydroEval: Streamflow Simulations Evaluator (Version 0.1.0). Zenodo. https://doi.org/10.5281/zenodo.2591217
    Adapted to work with PyTorch tensors of the shape (time_steps, n_pixels)
@@ -50,7 +49,6 @@ def KGE(y_pred, y_true, land_sea_mask=None):
    p_corr = r_num / r_den
    p_corr =  torch.where(r_den==0, torch.nan, p_corr)
    # calculate error in spread of flow alpha
-#  import pdb; pdb.set_trace()
    alpha = pred_std / true_std
    # make sure that we get nans (instead of infs) where ever we divide by 0 assuming those are the sea pixels
    alpha =  torch.where(true_std==0, torch.nan, alpha)
@@ -128,7 +126,6 @@ def KGE_for_multistep_pred(y_pred, y_true, land_sea_mask=None):
       p_corr = r_num / r_den
       p_corr =  torch.where(r_den==0, torch.nan, p_corr)
       # calculate error in spread of flow alpha
-   #  import pdb; pdb.set_trace()
       alpha = pred_std / true_std
       # make sure that we get nans (instead of infs) where ever we divide by 0 assuming those are the sea pixels
       alpha =  torch.where(true_std==0, torch.nan, alpha)
