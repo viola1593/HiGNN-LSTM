@@ -178,7 +178,7 @@ python scripts/evaluation_HiGNN.py --exp_path <experiment_dir>
 # Evaluate ConvLSTM2D
 python scripts/evaluation_ConvLSTM.py --exp_path <experiment_dir> 
 
-# Compare both models
+# Compare HiGNN-LSTM to FCast from Li et al.
 python scripts/compare_models.py
 ```
 
@@ -214,12 +214,6 @@ A stack of convolutional LSTM cells operating on the full 1° global grid. Each 
 
 ---
 
-## Experiment Details
-
-See [EXPERIMENTS.md](EXPERIMENTS.md) for the full hyperparameter tables, training curves, and reproduction notes for the results reported in the manuscript.
-
----
-
 ## Citation
 
 If you use this code or the pretrained models in your research, please cite:
@@ -242,3 +236,4 @@ If you use this code or the pretrained models in your research, please cite:
 - GRACE and GRACE-FO mission teams (NASA/DLR)
 - ERA5 reanalysis provided by the Copernicus Climate Change Service
 - PyTorch Lightning and PyTorch Geometric open-source communities
+-The implementation of the hierarchical GNN is deduced from https://github.com/corentin-dfg/graph4sen2dwater: "Forecasting water resources from satellite image time series using a graph-based learning strategy" by Corentin Dufourg, Charlotte Pelletier, Stéphane May and Sébastien Lefèvre, at ISPRS Technical Commission II Symposium 2024
