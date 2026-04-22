@@ -14,6 +14,7 @@ class HiGNN_LSTM(nn.Module):
     def __init__(self, num_features, num_ocean_features, horizon,  
                  sequence_length=12, twsa_index=0, hidden_dim=128, num_processing_gnns=3,
                  gnn_embedding_dim=4,
+                 skip_gnn=False,
                  rnn_hidden_size=32, 
                     rnn_layers=3, 
                     rnn_dropout=0.0,
@@ -30,6 +31,7 @@ class HiGNN_LSTM(nn.Module):
              hidden_dim (int, optional): Hidden dimension for the GNN layers. Default is 128.
              num_processing_gnns (int, optional): Number of GNN layers in the processing step. Default is 3.
              gnn_embedding_dim (int, optional): Dimension of the output from GNN. Default is 4.
+             skip_gnn (bool, optional): Whether to use skip the GNNs for each timestep. Used for ablation studies.Default is False.
              rnn_layers (int, optional): Number of RNN layers. Default is 3.
              rnn_hidden_size (int, optional): Hidden size for the RNN layers. Default is 32.
              rnn_dropout (float, optional): Dropout for the RNN layers. Default is 0.0.
@@ -44,6 +46,7 @@ class HiGNN_LSTM(nn.Module):
         self.horizon = horizon         
         self.hidden_dim = hidden_dim
         self.num_processing_gnns = num_processing_gnns
+        self.skip_gnn = skip_gnn
         self.gnn_embedding_dim = gnn_embedding_dim
         self.rnn_hidden_size = rnn_hidden_size
         self.rnn_layers = rnn_layers
@@ -103,10 +106,9 @@ class HiGNN_LSTM(nn.Module):
         for i in range(self.horizon):
             gnn_emb = data.clone() # cloning to get fresh data for each timestep
             timestep_embed = self.timestep_embeddings(torch.tensor(i, device=gnn_emb['grid'].x.device))# --> [batch_size* num_nodes, 1, hidden_dim/2]
-
-            gnn_emb, gamma_edge, beta_edge, gamma_node, beta_node = self.shared_forward(gnn_emb, timestep_embed)
-            
-            gnn_emb = self.mesh2grid(gnn_emb, gamma_edge, beta_edge, gamma_node, beta_node) 
+            if not self.skip_gnn:
+                gnn_emb, gamma_edge, beta_edge, gamma_node, beta_node = self.shared_forward(gnn_emb, timestep_embed)    
+                gnn_emb = self.mesh2grid(gnn_emb, gamma_edge, beta_edge, gamma_node, beta_node) 
             gnn_output = self.outputter(gnn_emb) # shape gnn_output [batch_size*num_nodes, seq_len* gnn_embedding_dim]
             
             gnn_output = gnn_output.reshape(batch_size, self.seq_len, -1) # reshape to [batch_size*num_nodes, seq_len, gnn_embedding_dim]

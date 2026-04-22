@@ -69,6 +69,7 @@ class HMModule(pl.LightningModule):
                                         sequence_length=self.sequence_len, twsa_index=0, 
                                         hidden_dim=hidden_dim, 
                                         num_processing_gnns=num_processing_gnns, 
+                                        skip_gnn=False,
                                         gnn_embedding_dim=gnn_embedding_dim,
                                         rnn_hidden_size=rnn_hidden_size, 
                                         rnn_layers=rnn_layers, 

@@ -106,7 +106,7 @@ See `data/README.md` for the ERA5 CDS API request and the expected directory lay
 
 ### Preprocessing
 
-All preprocessing scripts are in `scripts/preprocess_data/`. Update the input/output file paths at the top of each script before running. All outputs are NetCDF files on a common 1° × 1° global grid.
+All preprocessing scripts are in `scripts/preprocess_data/`. Update the input/output file paths at the top of each script before running. All outputs are NetCDF files on a common 1° × 1° global grid. The final preprocessed data used for training and evaluating the model is also available at [here](https://doi.org/10.5281/zenodo.19664592).
 
 **Step 1 — Convert GRACE-REC from `.mat` to NetCDF:**
 ```bash
@@ -214,21 +214,8 @@ A stack of convolutional LSTM cells operating on the full 1° global grid. Each 
 
 ---
 
-## Citation
 
-If you use this code or the pretrained models in your research, please cite:
 
-```bibtex
-@article{,
-  title  = {},
-  author = {},
-  journal= {},
-  year   = {2025},
-  doi    = {}
-}
-```
-
----
 
 
 ## Acknowledgements
@@ -236,4 +223,4 @@ If you use this code or the pretrained models in your research, please cite:
 - GRACE and GRACE-FO mission teams (NASA/DLR)
 - ERA5 reanalysis provided by the Copernicus Climate Change Service
 - PyTorch Lightning and PyTorch Geometric open-source communities
--The implementation of the hierarchical GNN is deduced from https://github.com/corentin-dfg/graph4sen2dwater: "Forecasting water resources from satellite image time series using a graph-based learning strategy" by Corentin Dufourg, Charlotte Pelletier, Stéphane May and Sébastien Lefèvre, at ISPRS Technical Commission II Symposium 2024
+- The implementation of the hierarchical GNN is deduced from https://github.com/corentin-dfg/graph4sen2dwater: "Forecasting water resources from satellite image time series using a graph-based learning strategy" by Corentin Dufourg, Charlotte Pelletier, Stéphane May and Sébastien Lefèvre, at ISPRS Technical Commission II Symposium 2024
