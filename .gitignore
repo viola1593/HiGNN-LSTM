@@ -1,7 +1,9 @@
 # Data and checkpoints
-data/
+# NOTE: use "dir/*" rather than "dir/", otherwise the "!" re-includes below have no
+# effect - git does not descend into an excluded directory.
+data/*
 !data/README.md
-checkpoints/
+
 !checkpoints/README.md
 
 # Outputs and results
@@ -15,7 +17,19 @@ finetune/
 feature_importance/
 fi_analysis/
 figures_deaseas/
-graphs/
+
+# Precomputed graph structure: the edge indices, the ocean k-means model and the
+# land-point-to-basin lookup are tracked (~1.8 MB) so that the heterogeneous graph
+# is bit-identical to the one the released checkpoints were trained on.
+# Cluster diagnostic plots are regenerated at runtime and stay ignored.
+graphs/*
+graphs_archived/
+!graphs/*/
+graphs/*/*
+!graphs/*/*.pt
+!graphs/*/*.pkl
+!graphs/*/landpoints_to_basin.csv
+
 
 # Pycache and Python
 __pycache__/
@@ -61,3 +75,14 @@ Thumbs.db
 .pytest_cache/
 .coverage
 htmlcov/
+
+# data files
+*.cpg
+*.dbf
+*.shp
+*.shx
+*.gpkg
+*.png
+
+discussions/
+writing/

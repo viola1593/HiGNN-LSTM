@@ -10,12 +10,17 @@ from torch.utils.data import Dataset
 # create cell dataset
 class TWSA2DDataset(Dataset):
     def __init__(self, ds_local, time_period, target='twsa', delay=12, input_seq_len=12, output_seq_len=1, time_step=None,
-                   input_vars=None, scaling_mean_std=None, features_nanfill=0., **kwargs):
+                   input_vars=None, scaling_mean_std=None, features_nanfill=0., twsa_climatology=None,
+                   era5_climatology=None, **kwargs):
         """
         ds_local: xarray dataset with coords (latitude, longitude, time)
         input_seq_len: number of time steps in the feature sequence length
         delay: number of time steps between end of sequence and target
-        time_step: provide a specific time step to only get the data for that time step for prediction (default None)"""
+        time_step: provide a specific time step to only get the data for that time step for prediction (default None)
+        twsa_climatology: training climatology [month, lat, lon] in cm. If given, twsa is normalized
+            as the anomaly twsa - C[month] and each sample carries C of its target months as twsa_offset
+        era5_climatology: training climatology with one [month, lat, lon] variable per ERA5 input.
+            If given, each of its variables is normalized as the anomaly var - C[var][month]"""
         self.ds_local = ds_local
     
         self.ds_timeslice = ds_local.sel(time=slice(time_period[0], time_period[1])).astype(np.float32)
@@ -41,7 +46,19 @@ class TWSA2DDataset(Dataset):
         self.mask_not_antarctica = (self.ds_timeslice.lsm.where(self.ds_timeslice['lat']<-60)*0).fillna(1).astype('bool').values
         
         self.time_step = time_step
-        
+
+        self.twsa_offset = None
+        if twsa_climatology is not None:
+            # anomaly space: the per-pixel normalization below then scales twsa - C[month]
+            clim = twsa_climatology.sel(month=self.ds_timeslice.time.dt.month).drop_vars('month')
+            self.ds_timeslice['twsa'] = self.ds_timeslice['twsa'] - clim
+            self.twsa_offset = torch.from_numpy(clim.values) # [time, lat, lon]
+
+        if era5_climatology is not None:
+            for var in era5_climatology.data_vars:
+                self.ds_timeslice[var] = (self.ds_timeslice[var]
+                                          - era5_climatology[var].sel(month=self.ds_timeslice.time.dt.month).drop_vars('month'))
+
         self.normalize_ds_timeslice()
         self.month_to_features()
         self.samples = self.get_sample_indices()
@@ -69,22 +86,27 @@ class TWSA2DDataset(Dataset):
       
         else: 
             feature_indices_list = [t for t in range(self.input_seq_len, len(self.ds_timeslice.time)-self.delay-self.pred_len+1)]
-                        
+            # keep only windows over consecutive months (GRACE has missing months)
+            months = self.ds_timeslice.time.values.astype('datetime64[M]').astype(int)
+            window = self.input_seq_len + self.delay + self.pred_len
+            feature_indices_list = [t for t in feature_indices_list
+                                    if months[t + self.delay + self.pred_len - 1] - months[t - self.input_seq_len] == window - 1]
+
         return feature_indices_list
 
 
     def normalize_ds_timeslice(self):
         mask_land =  self.land_ocean_mask # 1 is land and 0 is ocean
-        mask_ocean =  self.ds_timeslice['lsm'].values==0
+        mask_ocean =  ~mask_land
         mask_not_antarctica = (self.ds_timeslice.lsm.where(self.ds_timeslice['lat']<-60)*0).fillna(1).astype('bool').values
            
         if self.scaling_params is not None:
-            self.ds_timeslice = self.ds_timeslice.fillna(self.features_nanfill)
+            # NaNs are filled after normalization and masking (see below), the same order as in
+            # the training branch, so that a NaN inside the valid mask is encoded identically
             for i, var in enumerate(self.input_vars):
                 try:
                     assert var == self.scaling_params[i][0].name
                     assert var == self.scaling_params[i][1].name
-                
                     self.ds_timeslice[var] = (self.ds_timeslice[var] - self.scaling_params[i][0]) / self.scaling_params[i][1]
                 except (AssertionError, AttributeError): print(f"Variable {var} not found in scaling parameters, skipping normalization")
                 
@@ -100,8 +122,6 @@ class TWSA2DDataset(Dataset):
                 self.ds_timeslice[var] = self.ds_timeslice[var].fillna(self.features_nanfill)
           
         else:
-            epsilon=1e-6
-            
             scaling_mean_std =[]
             for var in self.input_vars:
                 if var in self.land_variables:
@@ -119,7 +139,11 @@ class TWSA2DDataset(Dataset):
                     warnings.simplefilter("ignore", category=RuntimeWarning)
                     ds_mean = self.ds_timeslice[var].where(mask).mean(dim='time')
                     ds_std = self.ds_timeslice[var].where(mask).std(dim='time')
-                    ds_std = ds_std.where(ds_std.values>=epsilon, other=epsilon) # make sure not too small otherwise numerical instability will happen
+
+                    # clamp the divisor: a pixel with a std below the floor is attenuated
+                    # (its normalized std becomes std/epsilon < 1), never amplified
+                    epsilon = float(ds_std.median() * 0.01)
+                    ds_std = ds_std.clip(min=epsilon)
 
                 self.ds_timeslice[var] = (self.ds_timeslice[var]- ds_mean) / ds_std
                 self.ds_timeslice[var].values[~mask] = 0 #self.ds_timeslice[var].where(~mask, 0).fillna(self.features_nanfill)
@@ -173,10 +197,13 @@ class TWSA2DDataset(Dataset):
         target = self.features[pred_start:pred_end][:, self.target_id] 
         mask = self.land_ocean_mask[t] & self.mask_not_antarctica[t] # mask for land and not antarctica
         
-        return {
+        sample = {
             'x_sequence': input_features,
             'y_timestep': target,
             'land_mask': torch.Tensor(mask)
         }
+        if self.twsa_offset is not None:
+            sample['twsa_offset'] = self.twsa_offset[pred_start:pred_end] # C of the target months, added back in predict_step
+        return sample
 
 

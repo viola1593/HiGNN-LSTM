@@ -8,19 +8,11 @@ FiLM modulation and EdgePruner from Copliot (GPT-4.1)'''
 
 
 class Mesh2MeshGNN(nn.Module):
-    def __init__(self, mesh_node_dim, edge_dim, hid_dim, timestep_dim=None, generate_adj=False, k=10):
+    def __init__(self, mesh_node_dim, edge_dim, hid_dim, aggregation='sum'):
         super().__init__()
+        self.aggregation = aggregation
         self.edge_mlp = MLP(edge_dim+mesh_node_dim+mesh_node_dim, hid_dim, hid_dim)
         self.mesh_mlp = MLP(mesh_node_dim+hid_dim, hid_dim, hid_dim)
-
-        
-        if generate_adj:
-            self.k = k 
-            self.edge_predictor = nn.Sequential(
-                nn.Linear(mesh_node_dim * 2, hid_dim),
-                nn.ReLU(),
-                nn.Linear(hid_dim, 1)
-            )
 
 
     def forward(self, data, gamma_edge=None, beta_edge=None, gamma_node=None, beta_node=None):
@@ -37,18 +29,18 @@ class Mesh2MeshGNN(nn.Module):
         
         # FiLM modulation for edge MLP input
         if gamma_edge is not None:
-            edge_input = gamma_edge * edge_input + beta_edge
+            edge_input = (1 + gamma_edge) * edge_input + beta_edge
 
         
         edge_new = self.edge_mlp(edge_input)
 
         # Node update
-        agg_edge = pyg.utils.scatter(edge_new, target_nodes, dim=0, reduce='sum', dim_size=data['mesh'].x.shape[0])
+        agg_edge = pyg.utils.scatter(edge_new, target_nodes, dim=0, reduce=self.aggregation, dim_size=data['mesh'].x.shape[0])
         node_input = torch.cat([data['mesh'].x, agg_edge], dim=-1)
 
         # FiLM modulation for edge MLP input
-        if gamma_edge is not None:
-            node_input = gamma_node * node_input + beta_node
+        if gamma_node is not None:
+            node_input = (1 + gamma_node) * node_input + beta_node
 
         mesh_new = self.mesh_mlp(node_input)
 

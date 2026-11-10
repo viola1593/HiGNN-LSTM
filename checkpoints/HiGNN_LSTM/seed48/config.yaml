@@ -1,0 +1,65 @@
+datamodule:
+  batch_size: 8
+  delay: 0
+  ds_path: data/processed/02_RecTWSA_era5.nc
+  era5_anomaly: true
+  graph_embedding_version: unitsphere_v2
+  graph_variant: full
+  input_seq_len: 12
+  input_vars:
+  - twsa
+  - sst
+  - sp
+  - t2m
+  - si10
+  - tp
+  - e
+  - ro
+  - pev
+  k_mesh2grid: 3
+  k_mesh2mesh: 10
+  num_ocean_clusters: 20
+  num_workers: 8
+  output_seq_len: 6
+  train_val_test_split:
+  - 0.7
+  - 0.2
+  - 0.1
+  twsa_anomaly: true
+debug: false
+experiment:
+  exp_dir: experiments/HiGNN/V0anom/seeds_era5anom_nores_02
+  experiment_name: V0anom_graphv2_era5anom
+  save_dir: experiments/HiGNN/V0anom/seeds_era5anom_nores_02/V0anom_graphv2_era5anom_full_seed48_10-27-2026_12:12:40
+  seed: 48
+load_checkpoint: null
+model:
+  gnn_embedding_dim: 4
+  hidden_dim: 32
+  learning_rate: 0.002
+  lr_scheduler: cosine
+  num_processing_gnns: 1
+  plot_intermediate: 50
+  residual_from_last: false
+  rnn_dropout: 0.4
+  rnn_hidden_size: 32
+  rnn_layers: 1
+  skip_gnn: false
+  timestep_embed_dim: 2
+pl:
+  accelerator: gpu
+  accumulate_grad_batches: 2
+  check_val_every_n_epoch: 1
+  detect_anomaly: false
+  deterministic: true
+  devices:
+  - 0
+  fast_dev_run: false
+  log_every_n_steps: 10
+  max_epochs: 50
+  max_steps: -1
+  overfit_batches: 0
+  precision: bf16-mixed
+wandb:
+  mode: online
+  project: twsa_heterograph_review

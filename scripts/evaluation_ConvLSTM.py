@@ -7,31 +7,19 @@ import matplotlib.pyplot as plt
 import numpy as np
 import os
 import pandas as pd
+
 import pytorch_lightning as pl
 
 import torch
 import torchmetrics
 from typing import Any, Dict
-import xarray as xr
-import yaml
 
 
 from datamodules.TWSA_datamodule2D import TWSA_Datamodule2D
-from losses.kge import KGE
+
 from models.pl_convlstm import ConvLSTMModule
-
-
-
-# Function to load yaml configuration file
-def read_config(config_path):
-    with open(config_path) as file:
-        config = yaml.safe_load(file)
-
-    return config
-
-def save_config(config, path):
-    with open(path, 'w') as file:
-        yaml.dump(config, file)
+from utils.eval_metrics import _rmse, load_grace_climatology, nse, per_lead_skill_scores, recover_month_index
+from utils.utils import read_config, save_config
 
 
 def generate_trainer(config: Dict[str, Any]) -> pl.Trainer:
@@ -55,16 +43,17 @@ def generate_trainer(config: Dict[str, Any]) -> pl.Trainer:
         )
 
 
-def create_experiment_dir(config: Dict[str, Any], experiment_path) -> str:
+def create_experiment_dir(config: Dict[str, Any], experiment_path, dataset: str="test") -> str:
     """Create experiment directory.
 
     Args:
         config: config file
+        dataset: dataset name (test, val or grace)
 
     Returns:
         config with updated save_dir
     """
-    exp_dir_path = os.path.join(f"eval_on_test", experiment_path)
+    exp_dir_path = os.path.join(experiment_path, f"eval_on_{dataset}")
     os.makedirs(exp_dir_path, exist_ok=True)
     config["experiment"]["save_dir"] = exp_dir_path
     
@@ -238,47 +227,6 @@ def plot_explained_variance(y_hat, y_true, datamodule, save_dir=None):
         plt.savefig(save_dir)
         plt.close()
 
-def recover_month_index(month_sin, month_cos):
-    # shape: [B, T]
-    angle = torch.atan2(month_sin, month_cos)  # range: [-π, π]
-    month_float = (angle % (2 * np.pi)) * 12 / (2 * np.pi)  # range: [0, 12)
-    month_index = month_float.long()  # round down to nearest integer (0–11)
-    return month_index
-
-
-def compute_climatology(dataset: xr.DataArray, lsm):
-    
-    """Compute climatology from the dataset."""
-    climatology = dataset.groupby('time.month').mean(dim='time').values  # [12, N]
-    
-    return climatology  # [12, 180, 360]
-
-
-def nse(y_hat, y_true):
-    """Calculate Nash-Sutcliffe Efficiency (NSE) with long term mean (climatology) or ground truth.
-    y_hat: shape [T (time steps), N (num nodes)]
-    y_true: shape [T, N]"""
-    numerator = torch.sum((y_true - y_hat) ** 2, dim=0)
-    denominator = torch.sum((y_true - torch.mean(y_true, dim=0, keepdim=True)) ** 2, dim=0)
-    return 1 - numerator / (denominator + 1e-8)
-
-
-def _mape(y_hat, y_true):
-    """Calculate Mean Absolute Percentage Error (MAPE) between two tensors."""
-    # Avoid division by zero
-    epsilon = 1e-8
-    return torch.mean(torch.abs((y_true - y_hat) / (y_true + epsilon)), dim=1) * 100  # in percentage
-
-def _rmse(y_hat, y_true):
-    """Calculate Root Mean Squared Error (RMSE) between two tensors."""
-    return torch.sqrt(torch.mean((y_true - y_hat) ** 2, dim=1))  # RMSE
-
-def _smape(y_hat, y_true):
-    """Calculate Symmetric Mean Absolute Percentage Error (SMAPE) between two tensors."""
-    # Avoid division by zero
-    epsilon = 1e-8
-    return torch.mean(torch.abs(y_true - y_hat) / (torch.abs(y_true) + torch.abs(y_hat) + epsilon), dim=1) * 100  # in percentage
-
 def calculate_per_timestep_scores(y_hat, y_true, climatology, scores_dict, metrics_dict, lsm=None):
     """Calculate per timestep scores for the given predictions and ground truth."""
     
@@ -329,7 +277,7 @@ def calculate_per_timestep_scores(y_hat, y_true, climatology, scores_dict, metri
     return scores_dict
 
 
-def evaluate(experiment_path, gpu):
+def evaluate(experiment_path, gpu, dataset="test"):
     """Evaluation Script."""
     # torch.set_float32_matmul_precision("medium")
     
@@ -338,7 +286,7 @@ def evaluate(experiment_path, gpu):
     # exchange devices to given gpu in config
     config['pl']['devices'] = [gpu]
 
-    config = create_experiment_dir(config, experiment_path)
+    config = create_experiment_dir(config, experiment_path, dataset=dataset)
 
     # generate trainer
     trainer = generate_trainer(config)
@@ -350,19 +298,16 @@ def evaluate(experiment_path, gpu):
 
     
 
-    # Recursively search for .ckpt files in all subfolders
-    ckpt_files = glob.glob(os.path.join(experiment_path, "**", "*.ckpt"), recursive=True)
-    
-    if ckpt_files:
-        # Use the latest checkpoint (by modification time)
-        latest_ckpt = min(ckpt_files, key=os.path.getmtime)
-        print(f"Found checkpoint: {latest_ckpt}")
-    else:
-        print("No checkpoint found.")
+    # the best-val_rmse checkpoint is the only .ckpt in the experiment dir besides last.ckpt
+    ckpt_files = [p for p in glob.glob(os.path.join(experiment_path, "**", "*.ckpt"), recursive=True)
+                  if os.path.basename(p) != "last.ckpt"]
+    assert len(ckpt_files) == 1, f"expected one best-val_rmse ckpt in {experiment_path}, got {ckpt_files}"
+    best_ckpt = ckpt_files[0]
+    print(f"Loading best-val_rmse checkpoint: {best_ckpt}")
 
-  
+
     #load model from checkpoint
-    model = ConvLSTMModule.load_from_checkpoint(latest_ckpt, **config["model"], 
+    model = ConvLSTMModule.load_from_checkpoint(best_ckpt, **config["model"],
                                           kernel_size=(3,3),  map_location=f'cuda:{gpu}',                           
                                 # sequence_length=twsa_sequence_data.input_seq_len, 
                                 horizon=twsa_sequence_data.target_seq_len)
@@ -372,53 +317,50 @@ def evaluate(experiment_path, gpu):
     print(ModelSummary(model))
 
  # --------------------------------------------------------------------------------------------------------------
- # Validation scores
- # --------------------------------------------------------------------------------------------------------------
- # 
-    test_metrics = trainer.test(model, twsa_sequence_data)
-    # test before prediction important so trainer has access to datamodules unnormalization during prediction
-
- # --------------------------------------------------------------------------------------------------------------
  # Plotting predictions of last element in validation time series
  # --------------------------------------------------------------------------------------------------------------
  #  
     
-    dataloader_pred = twsa_sequence_data.predict_dataloader(period=twsa_sequence_data.train_val_test_periods['test'])
+    # grace_graceclim: C_grace replaces the training C in the model's in/outputs and in every score
+    grace_climatology = load_grace_climatology() if dataset == "grace_graceclim" else None
+    if dataset == "grace":
+        dataloader_pred = twsa_sequence_data.GRACE_dataloader()
+    elif dataset == "grace_graceclim":
+        dataloader_pred = twsa_sequence_data.GRACE_dataloader(twsa_climatology=grace_climatology)
+    else:
+        dataloader_pred = twsa_sequence_data.predict_dataloader(period=twsa_sequence_data.train_val_test_periods[dataset])
 
     try:  
         predictions = torch.load(os.path.join(config["experiment"]["save_dir"],"predictions.pt"))
     except FileNotFoundError:
         predictions = trainer.predict(model, dataloader_pred) # check which time period is being used, should be validation time period
         torch.save(predictions, os.path.join(config["experiment"]["save_dir"],"predictions.pt"))
-    try: 
-        climatology = torch.load(os.path.join(config["experiment"]["save_dir"],"climatology.pt"))
-    except FileNotFoundError:
-        
-        twsa_train = twsa_sequence_data.unnormalize_twsa(twsa_sequence_data.data_train.ds_timeslice['twsa'])
-        climatology = compute_climatology(twsa_train, lsm=twsa_sequence_data.data_train.ds_timeslice['lsm'])
-        torch.save(climatology, os.path.join(config["experiment"]["save_dir"],"climatology.pt"))
+    twsa_climatology = twsa_sequence_data.twsa_climatology if grace_climatology is None else grace_climatology
+    climatology = twsa_climatology.values.astype(np.float32) # raw training C (or C_grace) [12, H, W] in cm
 
     # get mask to mask antarctica out in the evaluation
     antarctica_mask =  twsa_sequence_data.get_landmask_without_antarctica()
     #climatology = climatology[:,antarctica_mask]  # [12, N]
 
-    metrics_dict = {'rmse': _rmse, 'mape': _mape, 'smape': _smape, 
+    # cos(lat) area weights of the cells calculate_per_timestep_scores keeps, in its row-major order
+    lat = twsa_sequence_data.data_train.ds_timeslice['lat'].values
+    lat_weights = torch.cos(torch.deg2rad(torch.Tensor(np.broadcast_to(lat[:, None], antarctica_mask.shape)[antarctica_mask])))  # [N]
+    metrics_dict = {'rmse': _rmse,
+                    'rmse_latw': lambda y_hat, y_true: _rmse(y_hat, y_true, lat_weights=lat_weights),
                     'exp_var': torchmetrics.regression.ExplainedVariance(multioutput='raw_values')}
 
-    per_timestep_scores = {'rmse': [], 'rmse_deseas': [], 'rmse_clim': [], 
-                               'mape': [], 'mape_deseas': [], 'mape_clim': [], 
-                               'smape': [], 'smape_deseas': [], 'smape_clim': [],
+    per_timestep_scores = {'rmse': [], 'rmse_deseas': [], 'rmse_clim': [],
+                               'rmse_latw': [], 'rmse_latw_deseas': [], 'rmse_latw_clim': [],
                                'exp_var': [], 'exp_var_deseas': [], 'exp_var_clim': []
                                }
-    basin_per_timestep_scores = {'rmse': [], 'rmse_deseas': [], 'rmse_clim': [], 
-                               'mape': [], 'mape_deseas': [], 'mape_clim': [], 
-                               'smape': [], 'smape_deseas': [], 'smape_clim': [],
+    basin_per_timestep_scores = {'rmse': [], 'rmse_deseas': [], 'rmse_clim': [],
                                'exp_var': [], 'exp_var_deseas': [], 'exp_var_clim': []
                                }
     pixel_kge_scores = []
     pixel_nse_scores = []
     basin_kge_scores = []
     clim_basin_kge_scores = []
+    skill_windows = []  # (pred, true, climatology) per window, each [T, N]
 
     horizon = twsa_sequence_data.target_seq_len
     
@@ -461,7 +403,9 @@ def evaluate(experiment_path, gpu):
                                                                 per_timestep_scores,
                                                                 metrics_dict, 
                                                                 lsm=antarctica_mask)
-            
+            skill_windows.append((twsa_pred[:, antarctica_mask], twsa_true[:, antarctica_mask],
+                                  torch.from_numpy(climatology[months[:, 0, 0]])[:, antarctica_mask]))
+
         
 
 
@@ -510,25 +454,6 @@ def evaluate(experiment_path, gpu):
             
             
             
-            # --------------------------------------------------------------------------------------------------------------
-            # KGE scores -- per pixel, deseasonalized
-            # --------------------------------------------------------------------------------------------------------------  
-
-            #calculate KGE
-            if False:
-                pixel_kge = KGE(twsa_pred_deseas.reshape(horizon, -1), twsa_true_deseas.reshape(horizon, -1)).cpu() 
-                plot_KGE(pixel_kge.reshape(4, 180,360), twsa_sequence_data, save_dir=os.path.join(config["experiment"]["save_dir"], f'KGE/NoClimPixelKGE{i}.png'))
-                pixel_kge_scores.append(pixel_kge)
-
-            # --------------------------------------------------------------------------------------------------------------
-            # KGE scores -- basinwise, deseasonalized
-            # --------------------------------------------------------------------------------------------------------------  
-            # basin_kge = KGE(torch.Tensor(pred_basin_mean-basin_mean_climatology), torch.Tensor(true_basin_mean-basin_mean_climatology)).cpu()
-            # basin_kge_scores.append(basin_kge)
-
-            # clim_basin_kge = KGE(torch.Tensor(basin_mean_climatology), torch.Tensor(true_basin_mean)).cpu()
-            # clim_basin_kge_scores.append(clim_basin_kge)
-            
 
 
             # --------------------------------------------------------------------------------------------------------------
@@ -572,10 +497,19 @@ def evaluate(experiment_path, gpu):
 
     with open(os.path.join(config["experiment"]["save_dir"], "mean_timestep_scores.json"), "w") as f:
             json.dump(MEAN_per_timestep_scores, f, indent=4)
+    with open(os.path.join(config["experiment"]["save_dir"], "std_timestep_scores.json"), "w") as f:
             json.dump(STD_per_timestep_scores, f, indent=4)
 
-    with open(os.path.join(config["experiment"]["save_dir"], "test_metrics.json"), "w") as f:
-        json.dump(test_metrics, f, indent=4)
+    # save scores to csv, laid out like evaluation_HiGNN.py's
+    pred_all, true_all, clim_all = (torch.stack(a).permute(0, 2, 1) for a in zip(*skill_windows))  # [windows, N, T]
+    per_timestep_df = pd.DataFrame({'rmse': MEAN_per_timestep_scores['rmse'],
+                                    'rmse_latw': MEAN_per_timestep_scores['rmse_latw'],
+                                    'clim_rmse': MEAN_per_timestep_scores['rmse_clim'],
+                                    'clim_rmse_latw': MEAN_per_timestep_scores['rmse_latw_clim']},
+                                   index=np.arange(horizon))
+    per_timestep_df = per_timestep_df.assign(**per_lead_skill_scores(pred_all, true_all, clim_all, lat_weights))
+    per_timestep_df.index.name = 'Timestep'
+    per_timestep_df.to_csv(os.path.join(config["experiment"]["save_dir"], "per_timestep_scores.csv"))
 
 
     
@@ -621,10 +555,12 @@ def start():
     parser.add_argument(
         "--gpu", help="GPU device ID", default=0, type=int,
     )
+    parser.add_argument(
+        "--dataset", help="Dataset to evaluate on (test, val, grace or grace_graceclim)", default="test", type=str)
 
     args = parser.parse_args()
 
-    evaluate(args.exp_path, gpu=args.gpu)
+    evaluate(args.exp_path, gpu=args.gpu, dataset=args.dataset)
 
 
 if __name__ == "__main__":

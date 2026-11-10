@@ -13,6 +13,7 @@ from torch.utils.data import DataLoader
 import pytorch_lightning as pl
 from datamodules.TWSA_dataset2D import TWSA2DDataset
 
+GRACE_PATH = 'data/processed/GRACE_era5.nc'
 
 
 def read_config(config_path):
@@ -23,11 +24,8 @@ def read_config(config_path):
 
 
 def collate_fn(batch):
-  return {
-      'x_sequence': torch.stack([x['x_sequence'] for x in batch]),
-      'y_timestep': torch.stack([x['y_timestep'] for x in batch]),
-      'land_mask': torch.stack([x['land_mask'] for x in batch]),
-}
+  # stacks every key of the samples, so 'twsa_offset' only when the datasets are in anomaly mode
+  return {key: torch.stack([x[key] for x in batch]) for key in batch[0]}
 
 class TWSA_Datamodule2D(LightningDataModule):
 
@@ -41,7 +39,9 @@ class TWSA_Datamodule2D(LightningDataModule):
             output_seq_len: int = 1, 
 
             train_val_test_split: Tuple[float, float, float] = (0.6, 0.2, 0.2),
-            **kwargs       
+            twsa_anomaly: bool = False, # models see and predict twsa - C_train[month]
+            era5_anomaly: bool = False, # models see every input except twsa and lsm as var - C_train[month]
+            **kwargs
             ):
         super(TWSA_Datamodule2D, self).__init__()
         self.ds_path = ds_path
@@ -50,7 +50,8 @@ class TWSA_Datamodule2D(LightningDataModule):
         self.target = target
         self.target_seq_len = output_seq_len
         self.train_val_test_split = train_val_test_split
-
+        self.twsa_anomaly = twsa_anomaly
+        self.era5_anomaly = era5_anomaly
 
         self.save_hyperparameters(logger=False)
 
@@ -63,7 +64,17 @@ class TWSA_Datamodule2D(LightningDataModule):
         self.input_vars = list(self.ds.data_vars.keys())
 
         self.train_val_test_periods = self.get_train_val_test_periods()
-        self.static_features = self.get_static_feat() #needed for certain edge constructors
+        # raw training climatology [month, lat, lon] in cm, also needed by eval in both modes.
+        # float32 so it does not promote the datasets' twsa, NaN (Antarctica, ocean) -> 0
+        self.twsa_climatology = (self.ds['twsa'].sel(time=slice(*self.train_val_test_periods['train']))
+                                 .groupby('time.month').mean('time').fillna(0).astype(np.float32))
+        # same for every other input (the ERA5 variables), NaN outside a variable's domain -> 0.
+        # not lsm: it is static, its climatology is itself and the anomaly would be 0.
+        # only built when used: with input_vars=['twsa', 'lsm'] there is nothing to average
+        self.era5_climatology = (self.ds[[v for v in self.input_vars if v not in ('twsa', 'lsm')]]
+                                 .sel(time=slice(*self.train_val_test_periods['train']))
+                                 .groupby('time.month').mean('time').fillna(0).astype(np.float32)
+                                 if era5_anomaly else None)
 
         self.scaling_mean_std = None
 
@@ -120,6 +131,8 @@ class TWSA_Datamodule2D(LightningDataModule):
                                                     input_seq_len=self.input_seq_len,
                                                     output_seq_len=self.target_seq_len,
                                                     
+                                                    twsa_climatology=self.twsa_climatology if self.twsa_anomaly else None,
+                                                    era5_climatology=self.era5_climatology if self.era5_anomaly else None,
                                                     input_vars=list(self.ds.data_vars.keys()), 
                                                      
                                                     )
@@ -139,6 +152,8 @@ class TWSA_Datamodule2D(LightningDataModule):
                                                     output_seq_len=self.target_seq_len,
                                                     
                                                     scaling_mean_std=self.scaling_mean_std,
+                                                    twsa_climatology=self.twsa_climatology if self.twsa_anomaly else None,
+                                                    era5_climatology=self.era5_climatology if self.era5_anomaly else None,
                                                     input_vars=list(self.ds.data_vars.keys()), 
                                                      
                                                     )
@@ -155,6 +170,8 @@ class TWSA_Datamodule2D(LightningDataModule):
                                                     output_seq_len=self.target_seq_len,
                                                     
                                                     scaling_mean_std=self.scaling_mean_std,
+                                                    twsa_climatology=self.twsa_climatology if self.twsa_anomaly else None,
+                                                    era5_climatology=self.era5_climatology if self.era5_anomaly else None,
                                                     input_vars=list(self.ds.data_vars.keys()), 
                                                       
                                                     )
@@ -173,6 +190,8 @@ class TWSA_Datamodule2D(LightningDataModule):
                                                     output_seq_len=self.target_seq_len,
                                                     
                                                     scaling_mean_std=self.scaling_mean_std,
+                                                    twsa_climatology=self.twsa_climatology if self.twsa_anomaly else None,
+                                                    era5_climatology=self.era5_climatology if self.era5_anomaly else None,
                                                     input_vars=list(self.ds.data_vars.keys()), 
                                                      
                                                    )
@@ -266,9 +285,42 @@ class TWSA_Datamodule2D(LightningDataModule):
                                         input_seq_len=self.input_seq_len,
                                         output_seq_len=self.target_seq_len,
                                         scaling_mean_std=self.scaling_mean_std,
+                                        twsa_climatology=self.twsa_climatology if self.twsa_anomaly else None,
+                                        era5_climatology=self.era5_climatology if self.era5_anomaly else None,
                                         input_vars=list(self.ds.data_vars.keys())
                                         )
         
+        return DataLoader(dataset=self.data_pred,
+                    batch_size=self.hparams.batch_size,
+                    num_workers=self.hparams.num_workers,
+                    shuffle=False,
+                    drop_last=False,
+            collate_fn=collate_fn)
+
+    def GRACE_dataloader(self, time_step_idx: int=None, twsa_climatology=None):
+        """Predict on GRACE TWSA (same grid as the reconstruction), scaled with the training data.
+        twsa_climatology: [month, lat, lon] used instead of the training climatology for the twsa
+            input anomaly and twsa_offset (anomaly mode only). ERA5 climatology and scaling stay the training ones."""
+        if twsa_climatology is not None and not self.twsa_anomaly:
+            raise ValueError("twsa_climatology needs twsa_anomaly=True")
+        if twsa_climatology is None:
+            twsa_climatology = self.twsa_climatology
+        grace = xr.open_dataset(GRACE_PATH)
+        grace['twsa'] = xr.where(grace['lsm'], grace['twsa'], 0.0)  # zero ocean, as in the HiGNN GRACE loader
+        grace = grace[self.input_vars]  # drop extra variables, training order (scaling params match by position)
+        self.data_pred = TWSA2DDataset(grace,
+                                        time_period=(grace.time[0].values, grace.time[-1].values),
+                                        time_step=time_step_idx,
+                                        target='twsa',
+                                        delay=self.delay,
+                                        input_seq_len=self.input_seq_len,
+                                        output_seq_len=self.target_seq_len,
+                                        scaling_mean_std=self.scaling_mean_std,
+                                        twsa_climatology=twsa_climatology if self.twsa_anomaly else None,
+                                        era5_climatology=self.era5_climatology if self.era5_anomaly else None,
+                                        input_vars=list(self.input_vars)
+                                        )
+
         return DataLoader(dataset=self.data_pred,
                     batch_size=self.hparams.batch_size,
                     num_workers=self.hparams.num_workers,

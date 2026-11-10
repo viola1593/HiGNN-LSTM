@@ -6,13 +6,15 @@ import os
 import pandas as pd
 import pytorch_lightning as pl
 import torch
-import torchmetrics
 from typing import Any, Dict
-import xarray as xr
 
 
 from datamodules.TWSA_heterograph_datamodule import TWSA_HeteroGraphDatamodule
 from models.pl_hmmodel import HMModule
+from utils.eval_metrics import (_corr, _rmse, get_basin_wide_mean_twsa, get_climatology,
+                                get_months_output_sequences, gridded_score,
+                                gridded_skill_score, load_grace_climatology, mask_coverage,
+                                per_lead_skill_scores, recover_month_index, valid_mask)
 from utils.utils import read_config, save_config
 
 
@@ -48,6 +50,21 @@ def generate_trainer(config: Dict[str, Any]) -> pl.Trainer:
         )
 
 
+def find_month_gap(timesteps):
+    """Locate the widest gap in a monthly series of prediction dates.
+
+    Returns (last index before the gap, first index after it), or (None, None) if
+    the series is contiguous. Only the GRACE record has a gap; val and test do not.
+    """
+    dates = pd.to_datetime(timesteps)
+    steps = np.diff(dates.year * 12 + dates.month)
+    gaps = np.flatnonzero(steps > 1)
+    if len(gaps) == 0:
+        return None, None
+    widest = int(gaps[np.argmax(steps[gaps])])
+    return widest, widest + 1
+
+
 def create_experiment_dir(config: Dict[str, Any], dataset: str="test") -> str:
     """Create experiment directory.
 
@@ -58,7 +75,7 @@ def create_experiment_dir(config: Dict[str, Any], dataset: str="test") -> str:
     Returns:
         config with updated save_dir
     """
-    exp_dir_path = os.path.join(f"eval_on_{dataset}", config["experiment"]["save_dir"])
+    exp_dir_path = os.path.join(config["experiment"]["save_dir"], f"eval_on_{dataset}")
     os.makedirs(exp_dir_path, exist_ok=True)
     os.makedirs(os.path.join(exp_dir_path, "KGE"), exist_ok=True)
     os.makedirs(os.path.join(exp_dir_path, "BasinPlots"), exist_ok=True)
@@ -88,7 +105,7 @@ def plot_prediction(y_hat, y_true, datamodule, antarctica=None, start_date=None,
         ape = (y_hat[:,i]-y_true[:,i])
         p3 = axes[2,i].scatter(lon, lat, c=ape, cmap='RdBu',s=1, marker='.', vmin=-10, vmax=10)
         # suptitle with mean APE
-        axes[2,i].set_xlabel(f"MAD: {abs(ape).mean():.2f} cm", fontsize=fontsize)
+        axes[2,i].set_xlabel(f"MAD: {abs(ape).nanmean():.2f} cm", fontsize=fontsize)
         axes[0,i].set_title((start_date + pd.DateOffset(months=i)).strftime('%b %Y'), fontsize=fontsize+1)
         
         # remove axes tick labels
@@ -153,89 +170,6 @@ def plot_NSE_or_KGE(nse, datamodule, title='NSE', save_dir=None, vmin=0):
     plt.close()
 
 
-
-def recover_month_index(month_sin, month_cos):
-    # shape: [B, T]
-    angle = torch.atan2(month_sin, month_cos)  # range: [-π, π]
-    month_float = (angle % (2 * np.pi)) * 12 / (2 * np.pi)  # range: [0, 12)
-    month_index = month_float.long()  # round down to nearest integer (0–11)
-    return month_index
-
-
-def compute_climatology(data: xr.DataArray, lsm):
-    # y_true: [B, N, T], months: [B, T]
-    """Compute climatology from the dataset."""
-    climatology = data.groupby('time.month').mean(dim='time').values  # [12, N]
-    land_clim = climatology[lsm[:12]].reshape(12, -1)
-
-    return land_clim  # [12, Num land nodes]
-
-
-def basin_wide_mean_twsa(y_hat, y_true, climatology, datamodule):
-    """Calculate the basin wide mean TWSA predictions/ground truth per each time step.
-    Should be 238 (includes 1 dummy basin for hawaii) basins in total.
-    Args:
-        y_hat: predicted values, shape [T, N]
-        y_true: true values, shape [T, N]
-        datamodule: datamodule containing the land_ocean_mask
-    returns:
-        pred_basin_means: predicted basin means, shape [T, N_basins]
-        true_basin_means: true basin means, shape [T, N_basins]
-    """
-    
-    antarctica_mask =  (~datamodule.get_antarctica_landmask())
-    lon, lat = datamodule.data_pred.land[0][:,0], datamodule.data_pred.land[0][:,1]
-    land2basin = datamodule.data_pred.land_to_basin_ids
-    pred_basin_means = []
-    true_basin_means = []
-    climatology_mean = []
-    for pred, true, clim in zip(y_hat, y_true, climatology):
-        df = pd.DataFrame({
-            'lon': lon[antarctica_mask],
-            'lat': lat[antarctica_mask],
-            'twsa_pred': pred,
-            'twsa_true': true,
-            'climatology': clim,
-            'basin': land2basin[antarctica_mask]
-            })
-        groups = df.groupby('basin').mean()
-        
-        pred_basin_means.append(groups['twsa_pred'].values)
-        true_basin_means.append(groups['twsa_true'].values)
-        climatology_mean.append(groups['climatology'].values)
-    pred_basin_means = np.stack(pred_basin_means)  # [T, N]
-    true_basin_means = np.stack(true_basin_means)  # [T, N]
-    climatology_mean = np.stack(climatology_mean)  # [T, N]
-    return pred_basin_means, true_basin_means, climatology_mean, groups.index
-
-
-def _mape(y_hat, y_true):
-    """Calculate Mean Absolute Percentage Error (MAPE) between two tensors."""
-    # Avoid division by zero
-    epsilon = 1e-8
-    return torch.mean(torch.abs((y_true - y_hat) / (y_true + epsilon)), dim=1) * 100  # in percentage
-
-def _rmse(y_hat, y_true):
-    """Calculate Root Mean Squared Error (RMSE) between two tensors."""
-    return torch.sqrt(torch.mean((y_true - y_hat) ** 2, dim=1))  # RMSE
-
-def _smape(y_hat, y_true):
-    """Calculate Symmetric Mean Absolute Percentage Error (SMAPE) between two tensors."""
-    # Avoid division by zero
-    epsilon = 1e-8
-    return torch.mean(torch.abs(y_true - y_hat) / (torch.abs(y_true) + torch.abs(y_hat) + epsilon), dim=1) * 100  # in percentage
-
-def _corr(y_hat, y_true):
-    pearson = torchmetrics.PearsonCorrCoef(num_outputs=6)
-    return pearson(torch.Tensor(y_hat), torch.Tensor(y_true))
-
-def nse(y_hat, y_true):
-    """Calculate Nash-Sutcliffe Efficiency (NSE) with long term mean (climatology) or ground truth.
-    y_hat: shape [T (time steps), N (num nodes)]
-    y_true: shape [T, N]"""
-    numerator = torch.sum((y_true - y_hat) ** 2, dim=0)
-    denominator = torch.sum((y_true - torch.mean(y_true, dim=0, keepdim=True)) ** 2, dim=0)
-    return 1 - numerator / (denominator + 1e-8)
 
 def calculate_per_timestep_scores(y_hat, y_true, climatology, scores_dict, metrics_dict):
     """Calculate per timestep scores for the given predictions and ground truth.
@@ -304,9 +238,13 @@ def plot_basintwsa_timesteps(name, id, pred, true, clim,  ax, fontsize=14):
         
         # Plot last point
         ax.plot(x[-1], p[-1], color=lead_time_cmap(1.), linewidth=linewidth)
-        _corr = torchmetrics.PearsonCorrCoef(num_outputs=pred.shape[0])
-    corr = _corr(torch.Tensor(pred).squeeze().permute(1,0), torch.Tensor(true).squeeze().permute(1,0)).mean()
-    ax.set_title(f'{name} (r={corr:.2f})', fontsize=fontsize)
+
+    # r over the windows for each lead time, then averaged over the leads -- the same
+    # orientation as the Corrlead_deseas columns of basin_scores.csv. Correlating the 6 leads
+    # within a window instead would score 6 points against 6 points. Anomaly correlation:
+    # the basin climatology is removed from both, so the seasonal cycle adds no skill.
+    corr = _corr(pred[:,:,0] - clim[:,:,0], true[:,:,0] - clim[:,:,0]).mean()
+    ax.set_title(f'{name} ($r_{{anom}}$={corr:.2f})', fontsize=fontsize)
 
     ax.tick_params(axis='both', which='major', labelsize=fontsize)
     
@@ -353,20 +291,17 @@ def plot_basintwsa_per_lead(name, id, pred, true, seasonal, ax=None):
 
 
 def build_model_from_checkpoint(experiment_path, config, gpu, twsa_sequence_data):
-    # Recursively search for .ckpt files in all subfolders
-    ckpt_files = glob.glob(os.path.join(experiment_path, "**", "*.ckpt"), recursive=True)
-    
-    if ckpt_files:
-        # Use the latest checkpoint (by modification time)
-        latest_ckpt = min(ckpt_files, key=os.path.getmtime)
-        print(f"Found checkpoint: {latest_ckpt}")
-    else:
-        print("No checkpoint found.")
-        return None
+    # the best-val_rmse checkpoint is the only .ckpt in the experiment dir besides last.ckpt
+    ckpt_files = [p for p in glob.glob(os.path.join(experiment_path, "*.ckpt"))
+                  if os.path.basename(p) != "last.ckpt"]
+    assert len(ckpt_files) == 1, f"expected one best-val_rmse ckpt in {experiment_path}, got {ckpt_files}"
+    best_ckpt = ckpt_files[0]
+    print(f"Loading best-val_rmse checkpoint: {best_ckpt}")
     #load model from checkpoint
-    model = HMModule.load_from_checkpoint(latest_ckpt, **config["model"], 
+    model = HMModule.load_from_checkpoint(best_ckpt, **config["model"],
                                           num_input_features=twsa_sequence_data.num_features,
                                           num_ocean_features=twsa_sequence_data.num_ocean_features,
+                                            use_ocean_nodes=twsa_sequence_data.use_ocean_nodes,
                                             sequence_length=twsa_sequence_data.input_seq_len,
                                             output_seq_len=twsa_sequence_data.target_seq_len, 
                                             land_sea_mask=None,
@@ -376,7 +311,8 @@ def build_model_from_checkpoint(experiment_path, config, gpu, twsa_sequence_data
     model.model_summary()
     return model
 
-def get_predictions(twsa_sequence_data, trainer, config, dataset='test', gpu=0):
+def get_predictions(twsa_sequence_data, trainer, config, experiment_path, dataset='test', gpu=0,
+                    grace_climatology=None, save=True):
     if dataset == "test":
         dataloader_pred = twsa_sequence_data.predict_dataloader(period=twsa_sequence_data.train_val_test_periods['test'])
     elif dataset == "val":
@@ -386,71 +322,38 @@ def get_predictions(twsa_sequence_data, trainer, config, dataset='test', gpu=0):
 
     elif dataset == "grace":
         dataloader_pred = twsa_sequence_data.GRACE_dataloader()
-    
+    elif dataset == "grace_graceclim":
+        dataloader_pred = twsa_sequence_data.GRACE_dataloader(twsa_climatology=grace_climatology)
+
     try:
         predictions = torch.load(os.path.join(config["experiment"]["save_dir"],"predictions.pt"))
     except FileNotFoundError:
-        model = build_model_from_checkpoint(config["experiment"]["save_dir"], config, gpu, twsa_sequence_data)
+        predictions = None
+    # a cache from an older dataset or time window has a different number of samples
+    expected_rows = len(twsa_sequence_data.data_pred.samples) * twsa_sequence_data.data_pred.num_land_nodes()
+    if predictions is not None and sum(batch[0].shape[0] for batch in predictions) != expected_rows:
+        print('Cached predictions.pt does not match the prediction dataset, predicting again')
+        predictions = None
+    if predictions is None:
+        # the checkpoint lives in the training experiment dir, not in the evaluation output dir
+        model = build_model_from_checkpoint(experiment_path, config, gpu, twsa_sequence_data)
 
-        trainer.test(model, twsa_sequence_data)
-        # test before prediction important so trainer has access to datamodules unnormalization during prediction
         predictions = trainer.predict(model, dataloader_pred) # predict usually selects val time period
-        torch.save(predictions, os.path.join(config["experiment"]["save_dir"],"predictions.pt"))
+        if save:
+            torch.save(predictions, os.path.join(config["experiment"]["save_dir"],"predictions.pt"))
     return predictions
 
-def get_climatology(twsa_sequence_data, config):
-    # compute climatology from training data
-    try: 
-        climatology = torch.load(os.path.join(config["experiment"]["save_dir"],"climatology.pt"))
-    except FileNotFoundError:
-        twsa_train = twsa_sequence_data.unnormalize_twsa(twsa_sequence_data.data_train.ds_timeslice['twsa'])
-        climatology = compute_climatology(twsa_train, 
-                                            twsa_sequence_data.data_train.land_ocean_mask)
-        torch.save(climatology, os.path.join(config["experiment"]["save_dir"],"climatology.pt"))
-    return climatology
-
-
-def get_months_output_sequences(months_input_sequences, output_seq_len):
-    months_output_sequences = [(months_input_sequences[:,:, -1] +i +1)%12 for i in range(output_seq_len)]
-    months_output_sequences = torch.stack([(months_input_sequences[:,:, -1] +i +1)%12 for i in range(output_seq_len)])  # [horizon, Total_B, N]
-    months_output_sequences = months_output_sequences.permute(1,2,0)  # [Total_B, N, horizon]
-    return months_output_sequences  
-
-def get_basin_wide_mean_twsa(twsa_pred, twsa_true, climatology, months_output_sequences, datamodule):
-    # calculate basin-wide mean TWSA for each prediction sequence
-    pred_basin_mean = []
-    true_basin_mean = []
-    basin_mean_climatology = []
-    pred_month = []
-    
-    for (pred, true, months) in zip(twsa_pred, twsa_true, months_output_sequences):
-        pred, true, basin_clim, basin_ids = basin_wide_mean_twsa(pred.permute(1,0),
-                                                                  true.permute(1,0), 
-                                                                  climatology[months[0]], 
-                                                                   datamodule)
-        pred_basin_mean.append(pred)
-        true_basin_mean.append(true)
-        basin_mean_climatology.append(basin_clim)
-        pred_month.append(months[0])
-    pred_basin_mean = np.stack(pred_basin_mean)  # [B, T (horizon), N_basins]
-    true_basin_mean = np.stack(true_basin_mean)  # [B, T(horizon), N_basins]
-    basin_mean_climatology = np.stack(basin_mean_climatology)  # [B, T(horizon), N_basins]
-    pred_months = np.stack(pred_month)  # [B, T(horizon)]
-    
-    return pred_basin_mean, true_basin_mean, basin_mean_climatology, pred_months, basin_ids
-
-
-
-def evaluate(experiment_path, gpu, dataset="test"):
+def evaluate(experiment_path, gpu, dataset="test", scores_only=False):
     """Evaluation Script.
     Args:
         experiment_path: path to the experiment directory
         gpu: gpu id to use
-        dataset: dataset name (test or grace)
+        dataset: dataset name (test, val, grace or grace_graceclim)
+        scores_only: write only the score csvs, no predictions.pt and no figures
     """
-    
-    pl.seed_everything(42, workers=True)
+
     config = read_config(os.path.join(experiment_path,  'config.yaml'))
+    pl.seed_everything(config["experiment"].get("seed", 42), workers=True)
     # exchange devices to given gpu in config
     config['pl']['devices'] = [gpu]
 
@@ -468,9 +371,12 @@ def evaluate(experiment_path, gpu, dataset="test"):
     # Preparing predictions, ground truth, and climatology for evaluations and plotting
     # --------------------------------------------------------------------------------------------------------------
 
-    climatology = get_climatology(twsa_sequence_data, config)
+    # grace_graceclim: C_grace replaces the training C in the model's in/outputs and in every score
+    grace_climatology = load_grace_climatology() if dataset == 'grace_graceclim' else None
+    climatology = get_climatology(twsa_sequence_data, config, climatology=grace_climatology)
      # get list of length num_batches, each element is a tuple of (y_hat, y_true, input_features)
-    predictions = get_predictions(twsa_sequence_data, trainer, config, dataset=dataset, gpu=gpu)
+    predictions = get_predictions(twsa_sequence_data, trainer, config, experiment_path, dataset=dataset, gpu=gpu,
+                                  grace_climatology=grace_climatology, save=not scores_only)
     time_period = twsa_sequence_data.data_pred.time_period
 
     sample_indices = twsa_sequence_data.data_pred.samples
@@ -495,22 +401,26 @@ def evaluate(experiment_path, gpu, dataset="test"):
     time_period = twsa_sequence_data.data_pred.time_period
     print('Prediction time period:' , time_period)
     num_nodes = twsa_sequence_data.data_pred.num_land_nodes() 
-    # get mask to mask antarctica out in the evaluation
-    antarctica_mask =  (~twsa_sequence_data.get_antarctica_landmask())
-    climatology = climatology[:,antarctica_mask]  # [12, N]
+
 
     
-    pred_basin_mean, true_basin_mean, basin_mean_climatology, pred_months, basin_ids = get_basin_wide_mean_twsa(twsa_pred, twsa_true, climatology, months_output_sequences, twsa_sequence_data)
+    lat_weights = torch.cos(torch.deg2rad(torch.Tensor(twsa_sequence_data.data_pred.land[0][:,1][antarctica_mask])))  # [N], cos(lat) area weights
+    pred_basin_mean, true_basin_mean, basin_mean_climatology, pred_months, basin_ids = get_basin_wide_mean_twsa(twsa_pred, twsa_true, climatology, months_output_sequences, twsa_sequence_data, lat_weights=lat_weights)
 
 
 
      # get climatology for the predicted months
     clim_pred = torch.Tensor(climatology[pred_months])
     
-    metrics_dict = {'rmse': _rmse, 'mape': _mape, 'smape': _smape}
-                    
-    per_timestep_scores = [{f'{name}': metric(twsa_pred, twsa_true).mean(dim=0) for name, metric in metrics_dict.items()}][0]
-    clim_per_timestep_scores = [{f'clim_{name}': metric(clim_pred.permute(0, 2, 1), twsa_true).mean(dim=0) for name, metric in metrics_dict.items()}][0]
+    metrics_dict = {'rmse': _rmse}
+
+    # score the model and the climatology baseline over the same cells
+    gridded_mask = valid_mask(twsa_pred, clim_pred.permute(0, 2, 1), twsa_true)
+    per_timestep_scores = [{f'{name}': metric(twsa_pred, twsa_true, mask=gridded_mask).mean(dim=0) for name, metric in metrics_dict.items()}][0]
+    per_timestep_scores['rmse_latw'] = _rmse(twsa_pred, twsa_true, mask=gridded_mask, lat_weights=lat_weights).mean(dim=0)
+    per_timestep_scores['coverage'] = mask_coverage(gridded_mask).mean(dim=0)
+    clim_per_timestep_scores = [{f'clim_{name}': metric(clim_pred.permute(0, 2, 1), twsa_true, mask=gridded_mask).mean(dim=0) for name, metric in metrics_dict.items()}][0]
+    clim_per_timestep_scores['clim_rmse_latw'] = _rmse(clim_pred.permute(0, 2, 1), twsa_true, mask=gridded_mask, lat_weights=lat_weights).mean(dim=0)
     basin_scores = [{f'{name}': metric(torch.Tensor(pred_basin_mean), torch.Tensor(true_basin_mean)).mean(dim=0) for name, metric in metrics_dict.items()}][0]
     basin_per_timestep_scores = [{f'{name}': metric(torch.Tensor(pred_basin_mean).permute(2, 0, 1), torch.Tensor(true_basin_mean).permute(2, 0, 1)).mean(dim=0) for name, metric in metrics_dict.items()}][0]
     corr_basin_timesteps = [_corr(pred_basin_mean[:,:,i], true_basin_mean[:,:,i]) for i in range(true_basin_mean.shape[-1])]
@@ -520,6 +430,8 @@ def evaluate(experiment_path, gpu, dataset="test"):
     # save scores to csv
     per_timestep_df = pd.DataFrame(per_timestep_scores, index=np.arange(6))
     per_timestep_df = per_timestep_df.assign(**clim_per_timestep_scores)
+    per_timestep_df = per_timestep_df.assign(**per_lead_skill_scores(
+        twsa_pred, twsa_true, clim_pred.permute(0, 2, 1), lat_weights))
     per_timestep_df.index.name = 'Timestep'
     per_timestep_df.to_csv(os.path.join(config["experiment"]["save_dir"],"per_timestep_scores.csv"))
     basin_df = pd.DataFrame(basin_scores, index=basin_ids)
@@ -532,6 +444,8 @@ def evaluate(experiment_path, gpu, dataset="test"):
     basin_per_timestep_df = pd.DataFrame(basin_per_timestep_scores, index=np.arange(6))
     basin_per_timestep_df.index.name = 'Timestep'
     basin_per_timestep_df.to_csv(os.path.join(config["experiment"]["save_dir"],"basin_per_timestep_scores.csv"))
+    if scores_only:
+        return
 
 
 # --------------------------------------------------------------------------------------------------------------
@@ -541,11 +455,14 @@ def evaluate(experiment_path, gpu, dataset="test"):
     from utils.utils import plot_rmse_broken_axis
 
     rmses = _rmse(twsa_pred, twsa_true)
+    # break the axis only where the series really is discontinuous (the GRACE gap);
+    # val and test are contiguous and get a single panel
+    gap_start_id, gap_end_id = find_month_gap(timesteps)
     fig, axes = plot_rmse_broken_axis(
     dates        = timesteps,      # length N datetime array
     rmse         = rmses.transpose(1,0),      # shape (6, N)
-    gap_start_id = 16,                   # index of Oct 2010
-    gap_end_id   = 17,                   # index of Nov 2019
+    gap_start_id = gap_start_id,         # last index before the gap, or None
+    gap_end_id   = gap_end_id,           # first index after the gap, or None
     lead_labels  = [f"Lead {i+1}" for i in range(6)],
     cmap_name    = "Blues_r",            # swap to "Reds_r" etc. if needed
     savepath     = os.path.join(config["experiment"]["save_dir"],"rmse_monthly.png"),
@@ -583,33 +500,44 @@ def evaluate(experiment_path, gpu, dataset="test"):
     #                                                   f"Predictions/Seq_{i}"), 
     #                                                   title=None)
     
-    # NSE, KGE scores
+    # NSE, KGE and correlation scores
     from scores.continuous import nse, kge
     from scores.continuous.correlation import pearsonr
-    
-    # calculate NSE accros all sequences
-    arr_pred = xr.DataArray(twsa_pred, dims=['batch', 'nodes', 'time'], coords={'batch': np.arange(twsa_pred.shape[0]), 
-                                                                            'nodes': np.arange(twsa_pred.shape[1]),
-                                                                            'time': np.arange(twsa_pred.shape[2])})
-    arr_true = xr.DataArray(twsa_true, dims=['batch','nodes', 'time'], coords={'batch': np.arange(twsa_true.shape[0]), 
-                                                                               'nodes': np.arange(twsa_true.shape[1]), 
-                                                                               'time': np.arange(twsa_true.shape[2])})
-    nse_score = nse(arr_pred, arr_true, reduce_dims=['time'])
-    kge_score = kge(arr_pred, arr_true, reduce_dims=['time'])
-    corr_score = pearsonr(arr_pred, arr_true, reduce_dims=['time'])
-    
-    # Plotting KGE, NSE scores and correlattion
-    plot_NSE_or_KGE(nse_score.mean(dim='batch'), twsa_sequence_data, title='NSE', vmin=0,
-                    save_dir=os.path.join(config["experiment"]["save_dir"], f'NSE/NSEmean.png'))
-    plot_NSE_or_KGE(kge_score.mean(dim='batch'), twsa_sequence_data, title='KGE', vmin=-0.41,
-                    save_dir=os.path.join(config["experiment"]["save_dir"], f'KGE/KGEmean.png'))
-    plot_NSE_or_KGE(corr_score.mean(dim='batch'), twsa_sequence_data, title='Correlation', vmin=0,
-                    save_dir=os.path.join(config["experiment"]["save_dir"], f'Corrmean.png'))
+
+    # every score reduces over the windows at a fixed lead, so it describes each
+    # node's series: reducing the 6 leads inside a window instead benchmarks that
+    # window against its own mean. CorrDeseas is the anomaly correlation -- raw
+    # TWSA r is carried by the annual cycle the climatology already reproduces.
+    # NSEclim and CorrDeseas are the pair that isolate skill beyond seasonality:
+    # NSEclim benchmarks against predicting the climatology instead of against the
+    # pixel's test-period mean, and CorrDeseas correlates the anomalies.
+    clim_gridded = clim_pred.permute(0, 2, 1)  # [windows, nodes, leads], as twsa_pred
+    scores = [('NSE', gridded_score(nse, twsa_pred, twsa_true), 0),
+              ('NSEclim', gridded_skill_score(twsa_pred, twsa_true, clim_gridded), 0),
+              ('KGE', gridded_score(kge, twsa_pred, twsa_true), -0.41),
+              ('Corr', gridded_score(pearsonr, twsa_pred, twsa_true), 0),
+              ('CorrDeseas', gridded_score(pearsonr, twsa_pred, twsa_true,
+                                           climatology=clim_gridded), 0)]
+
+    # Plotting KGE, NSE scores and correlattion. Skill against lead time is the
+    # point of a 6-step forecast, so each score keeps its leads next to the mean.
+    for label, score, vmin in scores:
+        os.makedirs(os.path.join(config["experiment"]["save_dir"], label), exist_ok=True)
+        plot_NSE_or_KGE(score.mean(dim='lead'), twsa_sequence_data,
+                        title=f'{label} (lead mean)', vmin=vmin,
+                        save_dir=os.path.join(config["experiment"]["save_dir"],
+                                              f'{label}/{label}mean.png'))
+        for lead in range(score.sizes['lead']):
+            plot_NSE_or_KGE(score.isel(lead=lead), twsa_sequence_data,
+                            title=f'{label} (lead {lead + 1})', vmin=vmin,
+                            save_dir=os.path.join(config["experiment"]["save_dir"],
+                                                  f'{label}/{label}_lead{lead + 1}.png'))
     # -----------------------------------------------------------
      # Plotting basin means 
     # ------------------------------------------------------------ 
-    if dataset == 'grace':
-        start_month_idx = 17
+    if dataset in ('grace', 'grace_graceclim'):
+        # first sample predicting Nov 2019, the first predicted month after the GRACE/GRACE-FO gap
+        start_month_idx = int(np.searchsorted(timesteps.astype('datetime64[M]'), np.datetime64('2019-11')))
     else: start_month_idx = 0
     start_year_month = timesteps[start_month_idx]
     fig, axes = plt.subplots(4, 4, figsize=(8,8), sharex=True)
@@ -660,56 +588,56 @@ def evaluate(experiment_path, gpu, dataset="test"):
     plt.savefig(os.path.join(config["experiment"]["save_dir"], 
                                                       f'BasinPlots/All_Basins.png'), dpi=300)
 
-    # -----------------------------------------------------------
-    # plot differnet time period
-    # ------------------------------------------------------------
-    end_month_idx = 17
-    start_year_month = timesteps[0]
-    start_year_month = twsa_sequence_data.data_pred.ds_timeslice.time.values[0]+ pd.DateOffset(years=1)
-    fig, axes = plt.subplots(4, 4, figsize=(15,15), sharex=True)
-    axes_flat = axes.flatten()
+    # # -----------------------------------------------------------
+    # # plot differnet time period
+    # # ------------------------------------------------------------
+    # end_month_idx = 17
+    # start_year_month = timesteps[0]
+    # start_year_month = twsa_sequence_data.data_pred.ds_timeslice.time.values[0]+ pd.DateOffset(years=1)
+    # fig, axes = plt.subplots(4, 4, figsize=(15,15), sharex=True)
+    # axes_flat = axes.flatten()
     
-    for i, (name, id) in enumerate(TEST_BASIN_IDS.items()):
-        if i == 16:
-            break
-        ax = axes_flat[i]
-        pred = pred_basin_mean[:end_month_idx,:,basin_ids == id] # shape (B, T)
-        true = true_basin_mean[:end_month_idx,:,basin_ids == id]
-        clim = basin_mean_climatology[:end_month_idx,:,basin_ids == id]
-        plot_basintwsa_timesteps(name, id, pred, true, clim, 
-                                  ax=ax)
-        # start x labels from +1 instead of 0 because of 12 months input 
+    # for i, (name, id) in enumerate(TEST_BASIN_IDS.items()):
+    #     if i == 16:
+    #         break
+    #     ax = axes_flat[i]
+    #     pred = pred_basin_mean[:end_month_idx,:,basin_ids == id] # shape (B, T)
+    #     true = true_basin_mean[:end_month_idx,:,basin_ids == id]
+    #     clim = basin_mean_climatology[:end_month_idx,:,basin_ids == id]
+    #     plot_basintwsa_timesteps(name, id, pred, true, clim, 
+    #                               ax=ax)
+    #     # start x labels from +1 instead of 0 because of 12 months input 
         
-        if i > 11:
+    #     if i > 11:
            
-            x_labels = [(start_year_month + pd.DateOffset(years=i)).strftime('%b %Y') for i in range(((len(pred)+6)//12+1))]
-            ax.set_xticks(list(np.arange(0,len(pred)+6+1, 12)))
-            ax.set_xticklabels(x_labels, rotation=90, fontsize=12)
-        else: 
-            ax.set_xticklabels([])
-        if i in [0,4,8,12]:
-            ax.set_ylabel('TWSA [cm]', fontsize=12)
-        ax.tick_params(axis='both', which='major', labelsize=14)
-    # ax.legend(loc='best', fontsize=12)
-    handles, labels = ax.get_legend_handles_labels()
-    legend_ax = fig.add_axes([0.60, 0.05, 0.2, 0.02]) 
-    legend_ax.axis("off")
-    legend_ax.legend(handles, labels,
-            loc="right",
-            fontsize=14)
+    #         x_labels = [(start_year_month + pd.DateOffset(years=i)).strftime('%b %Y') for i in range(((len(pred)+6)//12+1))]
+    #         ax.set_xticks(list(np.arange(0,len(pred)+6+1, 12)))
+    #         ax.set_xticklabels(x_labels, rotation=90, fontsize=12)
+    #     else: 
+    #         ax.set_xticklabels([])
+    #     if i in [0,4,8,12]:
+    #         ax.set_ylabel('TWSA [cm]', fontsize=12)
+    #     ax.tick_params(axis='both', which='major', labelsize=14)
+    # # ax.legend(loc='best', fontsize=12)
+    # handles, labels = ax.get_legend_handles_labels()
+    # legend_ax = fig.add_axes([0.60, 0.05, 0.2, 0.02]) 
+    # legend_ax.axis("off")
+    # legend_ax.legend(handles, labels,
+    #         loc="right",
+    #         fontsize=14)
     
-    # Add colorbar below all plots
-    lead_time_cmap = plt.cm.winter
-    sm = plt.cm.ScalarMappable(cmap=lead_time_cmap, norm=plt.Normalize(vmin=1, vmax=6))
-    sm.set_array([])
-    cbar_ax = fig.add_axes([0.15, 0.05, 0.4, 0.02])  # [left, bottom, width, height]
-    cbar = fig.colorbar(sm, cax=cbar_ax, orientation='horizontal')
-    cbar.set_label('HiGNN-LSTM lead time (months)', fontsize=14)
-    cbar.ax.tick_params(labelsize=14)
-    cbar.set_ticks([1, 2, 3, 4, 5, 6])
-    plt.tight_layout(rect=[0, 0.1, 1, 1])
-    plt.savefig(os.path.join(config["experiment"]["save_dir"], 
-                                                      f'BasinPlots/All_BasinsSeq0.png'), dpi=300)
+    # # Add colorbar below all plots
+    # lead_time_cmap = plt.cm.winter
+    # sm = plt.cm.ScalarMappable(cmap=lead_time_cmap, norm=plt.Normalize(vmin=1, vmax=6))
+    # sm.set_array([])
+    # cbar_ax = fig.add_axes([0.15, 0.05, 0.4, 0.02])  # [left, bottom, width, height]
+    # cbar = fig.colorbar(sm, cax=cbar_ax, orientation='horizontal')
+    # cbar.set_label('HiGNN-LSTM lead time (months)', fontsize=14)
+    # cbar.ax.tick_params(labelsize=14)
+    # cbar.set_ticks([1, 2, 3, 4, 5, 6])
+    # plt.tight_layout(rect=[0, 0.1, 1, 1])
+    # plt.savefig(os.path.join(config["experiment"]["save_dir"], 
+    #                                                   f'BasinPlots/All_BasinsSeq0.png'), dpi=300)
 
 
 
@@ -736,11 +664,13 @@ def start():
         "--gpu", help="GPU device ID", default=0, type=int,
     )
     parser.add_argument(
-        "--dataset", help="Dataset to evaluate on (test, val, or grace)", default="test", type=str)
+        "--dataset", help="Dataset to evaluate on (test, val, grace, or grace_graceclim)", default="test", type=str)
+    parser.add_argument("--scores_only", action="store_true",
+                        help="Write only the score csvs, no predictions.pt and no figures")
 
     args = parser.parse_args()
 
-    evaluate(args.exp_path, gpu=args.gpu, dataset=args.dataset)
+    evaluate(args.exp_path, gpu=args.gpu, dataset=args.dataset, scores_only=args.scores_only)
 
 
 if __name__ == "__main__":

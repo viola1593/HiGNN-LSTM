@@ -1,0 +1,56 @@
+datamodule:
+  batch_size: 8
+  debug: false
+  delay: 0
+  ds_path: data/processed/02_RecTWSA_era5.nc
+  era5_anomaly: true
+  input_seq_len: 12
+  input_vars:
+  - twsa
+  - sst
+  - sp
+  - t2m
+  - si10
+  - tp
+  - lsm
+  - e
+  - ro
+  - pev
+  num_workers: 4
+  output_seq_len: 6
+  train_val_test_split:
+  - 0.7
+  - 0.2
+  - 0.1
+  twsa_anomaly: true
+debug: false
+experiment:
+  exp_dir: experiments/baseline2D/anom/seeds_era5anom_nores_02
+  experiment_name: baseline2D_anom_era5anom_nores
+  save_dir: experiments/baseline2D/anom/seeds_era5anom_nores_02/baseline2D_anom_era5anom_nores_10-28-2026_12:28:21
+  seed: 48
+load_checkpoint: null
+model:
+  hidden_dim: 32
+  input_dim: 12
+  learning_rate: 0.002
+  lr_scheduler: cosine
+  num_layers: 1
+  residual_from_last: false
+pl:
+  accelerator: gpu
+  accumulate_grad_batches: 2
+  check_val_every_n_epoch: 1
+  detect_anomaly: false
+  deterministic: true
+  devices:
+  - 0
+  fast_dev_run: false
+  log_every_n_steps: 1
+  max_epochs: 50
+  max_steps: -1
+  overfit_batches: 0
+  precision: bf16-mixed
+wandb:
+  mode: online
+  project: twsa

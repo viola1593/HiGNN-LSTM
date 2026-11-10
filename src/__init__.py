@@ -1,8 +1,7 @@
 """TWSA HiGNN-LSTM: Global Water Storage Prediction Models."""
 
 __version__ = "1.0.0"
-__author__ = "Your Name"
-__email__ = "your.email@domain.com"
+__author__ = "Viola Steidl"
 
 from . import datamodules
 from . import models

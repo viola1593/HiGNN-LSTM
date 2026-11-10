@@ -28,10 +28,11 @@ def plot_graph(edge_index, pos_lat_lon, title=None, latlon_dest=None, vmax=None,
     if pyg.utils.is_undirected(edge_index):
         # Keep only 1 direction of edge_index
         
-        edge_index = edge_index[:, edge_index[0] < edge_index[1]]  # (2, M/2)
+        keep = edge_index[0] < edge_index[1]  # (M,)
+        edge_index = edge_index[:, keep]  # (2, M/2)
         if edge_attr is not None:
             # Also subset edge attributes
-            edge_attr = edge_attr[edge_index[0] < edge_index[1]]
+            edge_attr = edge_attr[keep]
     
     
     # Make lon x-axis
@@ -150,8 +151,9 @@ def plot_graph_3d(pos_lon_lat, edge_index, save_dir=None):
 
 
         # Plot great-circle edges
+    n_nodes = len(lons)
     for i, j in edge_index.transpose(1,0).numpy():
-        if i<292 and j <293:
+        if i<n_nodes and j<n_nodes:
             arc_points = great_circle_points(
                 lats[i].item(), lons[i].item(),
                 lats[j].item(), lons[j].item(),
@@ -217,8 +219,8 @@ from datetime import datetime
 def plot_rmse_broken_axis(
     dates,           # array of datetime objects or strings, length N
     rmse,            # array of shape (6, N) – one row per lead time
-    gap_start_id=17, # index of last date BEFORE gap (oct 2010)
-    gap_end_id=18,   # index of first date AFTER gap (nov 2019)
+    gap_start_id=None, # index of last date BEFORE gap; None -> series is contiguous
+    gap_end_id=None,   # index of first date AFTER gap
     lead_labels=None,
     ylabel="RMSE (cm EWH)",
     title=None,
@@ -233,7 +235,8 @@ def plot_rmse_broken_axis(
     ----------
     dates        : array-like of datetime | length N
     rmse         : np.ndarray, shape (n_leads, N)
-    gap_start_id : int  – last index of the pre-gap segment (inclusive)
+    gap_start_id : int | None – last index of the pre-gap segment (inclusive).
+                   None plots the whole series on a single axis, without a break.
     gap_end_id   : int  – first index of the post-gap segment (inclusive)
     lead_labels  : list of str, optional
     """
@@ -246,20 +249,17 @@ def plot_rmse_broken_axis(
         lead_labels = [f"Lead {i+1}" for i in range(n_leads)]
  
     # ── split into pre- and post-gap segments ──────────────────────────────
-    pre_idx  = slice(0, gap_start_id + 1)          # 0 … gap_start_id  (inclusive)
-    post_idx = slice(gap_end_id, N)                 # gap_end_id … end  (inclusive)
- 
-    dates_pre  = dates[pre_idx]
-    dates_post = dates[post_idx]
-    rmse_pre   = rmse[:, pre_idx]
-    rmse_post  = rmse[:, post_idx]
- 
-    n_pre  = len(dates_pre)
-    n_post = len(dates_post)
- 
+    if gap_start_id is None:
+        segments = [(dates, rmse)]
+    else:
+        pre_idx  = slice(0, gap_start_id + 1)      # 0 … gap_start_id  (inclusive)
+        post_idx = slice(gap_end_id, N)             # gap_end_id … end  (inclusive)
+        segments = [(dates[pre_idx],  rmse[:, pre_idx]),
+                    (dates[post_idx], rmse[:, post_idx])]
+
     # width ratio proportional to number of months shown
-    width_ratios = [n_pre, n_post]
- 
+    width_ratios = [len(seg_dates) for seg_dates, _ in segments]
+
     # ── colour map: one colour per lead ────────────────────────────────────
     cmap   = plt.get_cmap(cmap_name)
     colors = [cmap(i / (n_leads - 1 if n_leads > 1 else 1)) for i in range(n_leads)]
@@ -276,22 +276,24 @@ def plot_rmse_broken_axis(
         "ytick.minor.visible": True,
     })
  
-    fig, (ax1, ax2) = plt.subplots(
-        1, 2,
+    fig, axs = plt.subplots(
+        1, len(segments),
         figsize=figsize,
         sharey=True,
+        squeeze=False,
         gridspec_kw={"width_ratios": width_ratios, "wspace": 0.04},
     )
- 
-    # ── plot both segments ─────────────────────────────────────────────────
-    for lead_i in range(n_leads):
-        kw = dict(color=colors[lead_i], linewidth=1.3, alpha=0.9,
-                  label=lead_labels[lead_i])
-        ax1.plot(dates_pre,  rmse_pre[lead_i],  **kw)
-        ax2.plot(dates_post, rmse_post[lead_i], **kw, )
- 
+    axs = list(axs[0])
+    ax1 = axs[0]
+
+    # ── plot the segments ──────────────────────────────────────────────────
+    for ax, (seg_dates, seg_rmse) in zip(axs, segments):
+        for lead_i in range(n_leads):
+            ax.plot(seg_dates, seg_rmse[lead_i], color=colors[lead_i], linewidth=1.3,
+                    alpha=0.9, label=lead_labels[lead_i])
+
     # ── x-axis formatting ──────────────────────────────────────────────────
-    for ax, dts in zip([ax1, ax2], [dates_pre, dates_post]):
+    for ax, (dts, _) in zip(axs, segments):
         ax.xaxis.set_major_locator(mdates.YearLocator())
         ax.xaxis.set_major_formatter(mdates.DateFormatter("%Y"))
         ax.xaxis.set_minor_locator(mdates.MonthLocator(bymonth=[4, 7, 10]))
@@ -302,20 +304,22 @@ def plot_rmse_broken_axis(
     ax1.yaxis.set_minor_locator(ticker.AutoMinorLocator(2))
  
     # ── broken-axis diagonal marks ─────────────────────────────────────────
-    d      = 0.015   # size of diagonal tick marks in axes coordinates
-    kwargs = dict(transform=ax1.transAxes, color="k", clip_on=False, linewidth=0.9)
-    ax1.plot((1 - d, 1 + d), (-d, +d), **kwargs)   # bottom-right of ax1
-    ax1.plot((1 - d, 1 + d), (1 - d, 1 + d), **kwargs)  # top-right of ax1
- 
-    kwargs.update(transform=ax2.transAxes)
-    ax2.plot((-d, +d), (-d, +d), **kwargs)          # bottom-left of ax2
-    ax2.plot((-d, +d), (1 - d, 1 + d), **kwargs)   # top-left of ax2
- 
-    # hide inner spines to sell the break
-    ax1.spines["right"].set_visible(False)
-    ax2.spines["left"].set_visible(False)
-    ax2.tick_params(left=False)   # no y-ticks on right panel
- 
+    if len(segments) == 2:
+        ax2   = axs[1]
+        d      = 0.015   # size of diagonal tick marks in axes coordinates
+        kwargs = dict(transform=ax1.transAxes, color="k", clip_on=False, linewidth=0.9)
+        ax1.plot((1 - d, 1 + d), (-d, +d), **kwargs)   # bottom-right of ax1
+        ax1.plot((1 - d, 1 + d), (1 - d, 1 + d), **kwargs)  # top-right of ax1
+
+        kwargs.update(transform=ax2.transAxes)
+        ax2.plot((-d, +d), (-d, +d), **kwargs)          # bottom-left of ax2
+        ax2.plot((-d, +d), (1 - d, 1 + d), **kwargs)   # top-left of ax2
+
+        # hide inner spines to sell the break
+        ax1.spines["right"].set_visible(False)
+        ax2.spines["left"].set_visible(False)
+        ax2.tick_params(left=False)   # no y-ticks on right panel
+
     # ── labels, legend, title ──────────────────────────────────────────────
     ax1.set_ylabel(ylabel, labelpad=6)
  
@@ -337,19 +341,20 @@ def plot_rmse_broken_axis(
     if title:
         fig.suptitle(title, y=1.10, fontsize=12)
  
-    # gap annotation
-    fig.text(
-        0.01, 0.05,
-        "   ⋯\ndata gap\n2010–2019   ",
-        ha="left", va="top",
-        fontsize=8.5, color="0.5", style="italic",
-        transform=fig.transFigure,
-    )
- 
+    # gap annotation, spanning the months the break actually skips
+    if len(segments) == 2:
+        fig.text(
+            0.01, 0.05,
+            f"   ⋯\ndata gap\n{segments[0][0][-1]:%Y-%m}–{segments[1][0][0]:%Y-%m}   ",
+            ha="left", va="top",
+            fontsize=8.5, color="0.5", style="italic",
+            transform=fig.transFigure,
+        )
+
     fig.tight_layout()
  
     if savepath:
         fig.savefig(savepath, dpi=300, bbox_inches="tight")
         print(f"Saved to {savepath}")
  
-    return fig, (ax1, ax2)
+    return fig, tuple(axs)

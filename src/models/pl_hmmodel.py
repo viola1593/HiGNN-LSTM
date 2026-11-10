@@ -1,7 +1,8 @@
+import warnings
+
 import pytorch_lightning as pl
 import torch
 import torch.nn as nn
-import torchmetrics
 import wandb
 import matplotlib.pyplot as plt
 import numpy as np
@@ -16,18 +17,22 @@ class HMModule(pl.LightningModule):
     def __init__(self, num_input_features, 
                         num_ocean_features, 
                         sequence_length, 
-                        output_seq_len, 
-                        learning_rate=1e-3, 
-                        hidden_dim=128, 
+                        output_seq_len,
+                        timestep_embed_dim,
+                        learning_rate=1e-3,
+                        lr_scheduler=None,
+                        hidden_dim=128,
                         num_processing_gnns=3,
                         gnn_embedding_dim=4,
+                        skip_gnn=False,
                         rnn_layers=3,
                         rnn_hidden_size=32,
                         rnn_dropout=0.0,
-                        seq_emb_length=4,
-                        timestep_embed_dim=None,
                         land_sea_mask=None,
                         plot_intermediate=False,
+                        use_ocean_nodes=True,
+                        aggregation='sum',
+                        residual_from_last=True,
                         **kwargs
                         
             ):
@@ -39,16 +44,23 @@ class HMModule(pl.LightningModule):
                     num_ocean_features (int): Number of ocean features.
                     sequence_length (int): Length of the input sequence.
                     output_seq_len (int): Number of timesteps to forecast aka forceasting horizon.
+                    timestep_embed_dim (int): Dimension of the timestep embedding. Required, the
+                        model is always conditioned on the forecasting timestep.
                     learning_rate (float, optional): Learning rate. Default is 1e-3.
+                    lr_scheduler (str, optional): None or 'cosine' (annealed to 1% of learning_rate
+                        over trainer.max_epochs). Default is None.
                     hidden_dim (int, optional): Hidden dimension for the GNN layers. Default is 128.
                     num_processing_gnns (int, optional): Number of GNN layers in the processing step. Default is 3.
                     gnn_embedding_dim (int, optional): Dimension of the output from GNN. Default is 4.
                     rnn_layers (int, optional): Number of RNN layers. Default is 3.
                     rnn_hidden_size (int, optional): Hidden size for the RNN layers. Default is 32.
                     rnn_dropout (float, optional): Dropout for the RNN layers. Default is 0.0.
-                    seq_emb_length (int, optional): Length of the sequence embedding. Default is 4. Null means no temporal convolution of feature sequences.
-                    timestep_embed_dim (int, optional): Dimension of the timestep embedding. Default is None, which means no timestep embedding.
                     land_sea_mask (np.array, optional): Land-sea mask. Default is None.
+                    use_ocean_nodes (bool, optional): Whether the graph contains ocean nodes. Must match the
+                        graph variant of the datamodule (False for the no_ocean variant). Default is True.
+                    aggregation (str, optional): 'sum' or 'mean' message reduction in the GNN layers. Default is 'sum'.
+                    residual_from_last (bool, optional): Whether the forecast is a residual on top of the last
+                        input TWSA. False predicts TWSA directly (e.g. anomalies). Default is True.
                     **kwargs: Additional keyword arguments.
                  
                    """""
@@ -69,13 +81,15 @@ class HMModule(pl.LightningModule):
                                         sequence_length=self.sequence_len, twsa_index=0, 
                                         hidden_dim=hidden_dim, 
                                         num_processing_gnns=num_processing_gnns, 
-                                        skip_gnn=False,
+                                        skip_gnn=skip_gnn,
                                         gnn_embedding_dim=gnn_embedding_dim,
                                         rnn_hidden_size=rnn_hidden_size, 
                                         rnn_layers=rnn_layers, 
                                         rnn_dropout=rnn_dropout,
-                                        seq_emb_length=seq_emb_length,
-                                        timestep_embed_dim=timestep_embed_dim, 
+                                        aggregation=aggregation,
+                                        timestep_embed_dim=timestep_embed_dim,
+                                        use_ocean_nodes=use_ocean_nodes,
+                                        residual_from_last=residual_from_last,
                                                         )
  
 
@@ -84,19 +98,16 @@ class HMModule(pl.LightningModule):
         self.antarctica_mask = None
         self.lat = None
         self.learning_rate = learning_rate
+        self.lr_scheduler = lr_scheduler
 
 
 
 
-        self.criterion = nn.MSELoss() 
-        self.metrics = {'mse' : nn.MSELoss(),
+        self.metrics = nn.ModuleDict({'mse' : nn.MSELoss(),
                         'rmse': MeanSquaredError(squared=False), # RMSE
-                        'explained_var': torchmetrics.ExplainedVariance()
-                        }
-        
-        self.log_graph_edge_attr = False
+                        })
+
         self.prediction_gnn_outputs = None
-        self.attention = None
         
         
     def forward(self, data):
@@ -144,7 +155,10 @@ class HMModule(pl.LightningModule):
         self.ocean_clusters = self.trainer.datamodule.num_ocean_clusters
         if self.antarctica_mask is None:
             self.antarctica_mask = self._get_relevant_land().to(next(self.parameters()).device).bool()  # shape [num nodes]
-   
+
+    def on_validation_epoch_start(self):
+        self.metrics['rmse'].reset()
+
     def validation_step(self, batch, batch_idx):
         
         output, graphs, _ = self(batch)        
@@ -165,35 +179,23 @@ class HMModule(pl.LightningModule):
             loss_ = self.metrics['mse'](output[:, :, month], gt[:, :, month]) 
             self.log(f'val_mse_month{month}', loss_, batch_size=output.shape[0],  on_epoch=True, on_step=False)
             loss_mse += loss_ # sum the losses for each month
-            _rmse = self.metrics['rmse'].to(gt.device)
-            loss_ = _rmse(output[:, :, month], gt[:, :, month])
+            loss_ = self.metrics['rmse'](output[:, :, month], gt[:, :, month])
             self.log(f'val_rmse_month{month}', loss_, batch_size=output.shape[0],  on_epoch=True, on_step=False)
             loss_rmse += loss_ #
         self.log(f'val_mse', loss_mse, batch_size=output.shape[0], on_epoch=True)
         self.log(f'val_rmse', loss_rmse, batch_size=output.shape[0], on_epoch=True)
 
 
-
-    def log_edge_attr_distribution(self, graph_batch):
-        """
-        Log the distribution of edge attributes to wandb.
-        """
-        self.trainer.logger.experiment.log({'m2m_max_abs_edge_attr (last forecasting step)': 
-                wandb.Histogram(graph_batch.edge_attr.numpy()), 
-                                'epoch': self.trainer.current_epoch,
-                                                    'global_step': self.global_step})
-
- 
     def on_validation_end(self):
         '''Plotting intermediate TWSA predictions and graphs to wandb.
         TWSA plots show the first prediction in the last batch of the validation set.
         Corresponding mesh2mesh adjacency matrix is plotted for each month.'''
-        self.attention = self.model.attention_weights if self.model.attention_weights else None
         if self.plot_intermediate:
             if (self.trainer.current_epoch % self.plot_intermediate)==0:
                                 
                 predictions = self.last_validation_step_output.reshape(-1, self.num_nodes, self.horizon)
                 targets = self.last_validation_step_target.reshape(-1, self.num_nodes, self.horizon)
+                # in anomaly mode (datamodule.twsa_anomaly) these maps show twsa - C, not absolute TWSA
                 pred = self._twsa_unnormalizer(predictions[0]) # get the prediction of the first batch shape [batch_size,num nodes, horizon]
                 true = self._twsa_unnormalizer(targets[0]) # get the ground truth of the first batch shape [batch_size,num nodes, horizon]
               
@@ -209,7 +211,10 @@ class HMModule(pl.LightningModule):
         self.num_nodes = self.trainer.datamodule.data_test.num_land_nodes()
         self.ocean_clusters = self.trainer.datamodule.num_ocean_clusters
         self.antarctica_mask = self._get_relevant_land().to(next(self.parameters()).device).bool() # shape [num nodes]
-       
+
+    def on_test_epoch_start(self):
+        self.metrics['rmse'].reset()
+
     def test_step(self, batch, batch_idx):
         output, _, _ = self(batch)        
         batch_size = batch.batch_size
@@ -222,14 +227,13 @@ class HMModule(pl.LightningModule):
         loss_rmse=0
         for month in range(self.horizon):
             loss_ = self.metrics['mse'](output[:, :, month], gt[:, :, month]) 
-            self.log(f'val_mse_month{month}', loss_, batch_size=output.shape[0],  on_epoch=True, on_step=False)
+            self.log(f'test_mse_month{month}', loss_, batch_size=output.shape[0],  on_epoch=True, on_step=False)
             loss_mse += loss_ # sum the losses for each month
-            _rmse = self.metrics['rmse'].to(gt.device)
-            loss_ = _rmse(output[:, :, month], gt[:, :, month])
-            self.log(f'val_rmse_month{month}', loss_, batch_size=output.shape[0],  on_epoch=True, on_step=False)
+            loss_ = self.metrics['rmse'](output[:, :, month], gt[:, :, month])
+            self.log(f'test_rmse_month{month}', loss_, batch_size=output.shape[0],  on_epoch=True, on_step=False)
             loss_rmse += loss_ #
-        self.log(f'val_mse', loss_mse, batch_size=output.shape[0], on_epoch=True)
-        self.log(f'val_rmse', loss_rmse, batch_size=output.shape[0], on_epoch=True)
+        self.log(f'test_mse', loss_mse, batch_size=output.shape[0], on_epoch=True)
+        self.log(f'test_rmse', loss_rmse, batch_size=output.shape[0], on_epoch=True)
 
 
     
@@ -243,12 +247,22 @@ class HMModule(pl.LightningModule):
         self.prediction_gnn_outputs = gnn_outputs # save the last gnn outputs for visualization
         output = self._twsa_unnormalizer(output)
         y = self._twsa_unnormalizer(batch['grid'].y)
-        self.attention = self.model.attention_weights if hasattr(self.model, 'attention') else None
+        if 'twsa_offset' in batch['grid']: # anomaly mode: add C of the target months back -> absolute cm
+            output = output + batch['grid'].twsa_offset
+            y = y + batch['grid'].twsa_offset
         return output, y, batch, heterographs, gnn_outputs # Return the prediction, true value and the last input
         
     def configure_optimizers(self):
-        return torch.optim.AdamW(self.parameters(), 
+        optimizer = torch.optim.AdamW(self.parameters(),
                                  lr=self.learning_rate, weight_decay=1e-2)
+        if self.lr_scheduler is None:
+            return optimizer
+        if self.lr_scheduler != 'cosine':
+            raise ValueError(f"Unknown lr_scheduler: {self.lr_scheduler}")
+        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+            optimizer, T_max=self.trainer.max_epochs, eta_min=self.learning_rate * 0.01)
+        return {"optimizer": optimizer,
+                "lr_scheduler": {"scheduler": scheduler, "interval": "epoch"}}
     
     def _get_lat_weight(self):
          # compute latitude weights for the land pixels (apply antarctica mask to match later indexing)
@@ -265,8 +279,8 @@ class HMModule(pl.LightningModule):
     def _twsa_unnormalizer(self, data):
         if self.trainer is not None and self.trainer.datamodule is not None:
             return self.trainer.datamodule.unnormalize_twsa(data)
-        else: 
-            Warning('No DataModule found.')
+        else:
+            warnings.warn('No DataModule found.')
             return data
         
     def _get_relevant_land(self, greenland=True):
@@ -284,8 +298,8 @@ class HMModule(pl.LightningModule):
                 gl = self.trainer.datamodule.get_greenland_landmask()
                 mask = ~(ant | gl)
                 return torch.Tensor(mask)
-        else: 
-            Warning('No DataModule found.')
+        else:
+            warnings.warn('No DataModule found.')
             return None
         
 ## A few plotting functions 
@@ -300,7 +314,7 @@ class HMModule(pl.LightningModule):
         
         lon, lat = self.trainer.datamodule.data_val.land[0][:,0], self.trainer.datamodule.data_val.land[0][:,1]
         
-        vmax = 40
+        vmax = 15
         f, (ax1, ax2, ax3) = plt.subplots(3,1,figsize=(5,10))
         p1 = ax1.scatter(lon, lat, c=predictions, cmap='coolwarm', s=1,vmin=-vmax, vmax=vmax)
         p2 = ax2.scatter(lon, lat, c=targets, cmap='coolwarm', s=1,vmin=-vmax, vmax=vmax)
@@ -314,8 +328,8 @@ class HMModule(pl.LightningModule):
         f.suptitle(f'TWSA month={month} (Val Set)')
         
         plt.tight_layout()
-        plt.colorbar(p1, ax=ax1)
-        plt.colorbar(p2, ax=ax2)
+        plt.colorbar(p1, ax=ax1, extend='both')
+        plt.colorbar(p2, ax=ax2, extend='both')
         plt.colorbar(p3, ax=ax3, extend='both')
 
         if self.trainer is not None:
@@ -352,27 +366,6 @@ class HMModule(pl.LightningModule):
                                         'global_step': self.global_step})
             plt.close()
 
-    def plot_attention(self, graph, num_m2m_edges, month):      
-        edges = graph.edge_index[:,:num_m2m_edges].cpu()
-        # attentions in list are of shape [num_edges*batchsize, num attention heads], so we take the mean
-        # list of attention_weights per timesteps 
-        att = self.model.attention_weights[month][:num_m2m_edges].mean(dim=1).cpu() #mean over all heads
-        if self.trainer is not None:  
-            adj = to_dense_adj(edges, edge_attr=att)[0]
-            plt.imshow(adj, cmap='magma_r', interpolation='none')
-            # plt.imshow(adj, cmap='RdBu',norm=matplotlib.colors.TwoSlopeNorm(0), interpolation='none')
-            plt.colorbar()
-            plt.title(f'Mean Attention Month {month+1}')
-        
-            self.trainer.logger.experiment.log({f'Attention month {month+1}': wandb.Image(plt),
-                                        'epoch': self.trainer.current_epoch,
-                                        'global_step': self.global_step})
-            plt.close()
-        
-
-    
-    
-    
     def model_summary(self):
         """
         Print the model summary.

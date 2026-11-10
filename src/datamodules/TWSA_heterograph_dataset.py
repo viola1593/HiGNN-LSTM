@@ -1,6 +1,6 @@
+import copy
 import geopandas as gpd
 import matplotlib.pyplot as plt
-import networkx as nx
 import numpy as np
 import os
 import pandas as pd
@@ -14,15 +14,21 @@ import xarray as xr
 
 from datetime import datetime
 from pathlib import Path
-from shapely.geometry import Point, MultiPoint
+from shapely.geometry import Point
 from sklearn.cluster import KMeans
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import StandardScaler
 from torch.utils.data import Dataset
-from torch_geometric.utils import from_networkx, add_remaining_self_loops
-from tsl.ops.connectivity import adj_to_edge_index
+from torch_geometric.utils import add_remaining_self_loops
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
-from utils.utils import plot_graph, plot_graph_3d
+from utils.utils import plot_graph_3d
+
+
+def log_cache_hit(path):
+    '''Report which cached graph file was loaded and when it was written, so that a stale cache
+    is visible in the logs instead of being used silently.'''
+    mtime = datetime.fromtimestamp(Path(path).stat().st_mtime).strftime('%m-%d-%Y_%H:%M:%S')
+    print(f"Loaded cached graph file {path} (last modified {mtime})")
 
 
 
@@ -41,9 +47,13 @@ class TWSAGraphDataset(Dataset):
                  time_step=None,
                  positional_vars=None, 
                  land_ocean_mask: xr.DataArray=None,
-                 features_nanfill=0, 
-                 graph_path=None, 
-                 train_val_test_data='train'):
+                 features_nanfill=0,
+                 graph_path=None,
+                 train_val_test_data='train',
+                 use_ocean_nodes=True,
+                 local_ocean_coupling=False,
+                 twsa_climatology: xr.DataArray=None,
+                 era5_climatology: xr.Dataset=None):
         """
         ds: xarray dataset with coords (latitude, longitude, time)
         time_period: tuple with start and end time of the dataset
@@ -55,6 +65,14 @@ class TWSAGraphDataset(Dataset):
         input_vars: variables to include in the input sequence
         positional_vars: name of the positional coordinates in the dataset
         features_nanfill: value to fill nan values in the features
+        use_ocean_nodes: if False, no ocean clustering is done and the dataset has no ocean nodes
+            (no_ocean graph variant)
+        local_ocean_coupling: if True, ocean cluster nodes only send messages to their nearest
+            basins instead of to all of them (local_ocean graph variant)
+        twsa_climatology: training climatology [month, lat, lon] in cm. If given, twsa is normalized
+            as the anomaly twsa - C[month] and each sample carries C of its target months as twsa_offset
+        era5_climatology: training climatology with one [month, lat, lon] variable per input except twsa.
+            If given, each of its variables is normalized as the anomaly var - C[var][month]
         """
         super(TWSAGraphDataset, self).__init__()
 
@@ -65,13 +83,15 @@ class TWSAGraphDataset(Dataset):
 
          # Extract basin IDs if present in dataset
         if 'basin_id' in ds:
-            self.basin_ids = self.ds_timeslice.pop('basin_id')  # Store basin IDs
-            #self.ds_timeslice = self.ds_timeslice.drop_vars('basin_id')  # Remove from dataset
+            self.basin_ids = self.ds_timeslice['basin_id']  # Store basin IDs
+            self.ds_timeslice = self.ds_timeslice.drop_vars('basin_id')  # Remove from dataset
         else:
             self.basin_ids = None
         
         self.ocean_clustering = ocean_clustering
         self.num_ocean_clusters = num_ocean_clusters
+        self.use_ocean_nodes = use_ocean_nodes
+        self.local_ocean_coupling = local_ocean_coupling
         self.land_clustering = land_clustering
         self.target = target
         self.delay = delay_time
@@ -103,22 +123,38 @@ class TWSAGraphDataset(Dataset):
         self.only_land_variables = [ 'ro', 'pev', 'swvl1', 'swvl2', 'swvl3', 'swvl4','lai_hv', 'lai_lv']
         self.only_ocean_variables = ['sst']
 
+        self.twsa_offset = None
+        if twsa_climatology is not None:
+            # anomaly space: the per-pixel normalization below then scales twsa - C[month]
+            clim = twsa_climatology.sel(month=self.ds_timeslice.time.dt.month).drop_vars('month')
+            self.ds_timeslice['twsa'] = self.ds_timeslice['twsa'] - clim
+            # C on the land nodes in separate_land_ocean order, (num_nodes, num_time_steps) like target_series
+            self.twsa_offset = torch.from_numpy(clim.values[:, self.land_ocean_mask.isel(time=0).values]).T
 
+        if era5_climatology is not None:
+            for var in era5_climatology.data_vars:
+                self.ds_timeslice[var] = (self.ds_timeslice[var]
+                                          - era5_climatology[var].sel(month=self.ds_timeslice.time.dt.month).drop_vars('month'))
 
         self.normalize_ds_timeslice()
         self.month_to_features()
 
-        self.land, self.ocean, _ = self.separate_land_ocean() 
-        self.coarse_ocean = self.cluster_pixels(self.ocean, var_list=self.input_vars, 
-                                                      num_timesteps=len(self.ds_timeslice.time), 
-                                                      pixel_type='ocean')
+        self.land, self.ocean, _ = self.separate_land_ocean()
+        if self.use_ocean_nodes:
+            self.coarse_ocean = self.cluster_pixels(self.ocean, var_list=self.input_vars,
+                                                          num_timesteps=len(self.ds_timeslice.time),
+                                                          pixel_type='ocean')
+        else:
+            # no_ocean variant: no ocean cluster nodes at all, empty arrays keep the shapes below valid
+            self.coarse_ocean = (np.zeros((0, 2)),
+                                 np.zeros((len(self.input_vars), len(self.ds_timeslice.time), 0)))
 
                    
         self.samples = self.get_sample_indices()
         # get the coordinates of the nodes after coarsening
         self.coords = np.concatenate([self.land[0], self.coarse_ocean[0]], axis=0)
         self.features = torch.Tensor(self.land[1]).permute(2, 1, 0) # (num_nodes, num_time_steps, num_variables)
-        self.target =  self.features[:, : , self.target_index] # (num_nodes, num_time_steps)
+        self.target_series =  self.features[:, : , self.target_index] # (num_nodes, num_time_steps)
         self.ocean_features = [item for item in self.input_vars if item not in self.only_land_variables+['twsa']]
         self.ocean_indices = [i for i, item in enumerate(self.input_vars) if item in self.ocean_features]
         self.ocean_features = torch.Tensor(self.coarse_ocean[1]).permute(2, 1, 0)[:,:,self.ocean_indices]
@@ -129,7 +165,7 @@ class TWSAGraphDataset(Dataset):
             # this is for inference when we only want to predict one time step
             t = self.time_step
             if t < self.seq_len:
-                print(f"Time step {t} is before the local lag {self.seq_len}, setting time step to {self.seq_len}")
+                print(f"Time step {t} is before the local lag {self.seq_len}, setting time step to {t+self.seq_len}")
                 t += self.seq_len
             if t > len(self.ds_timeslice.time) - self.delay - self.pred_len:
                 print(f"Time step {t} is after the last possible time step, setting time step to {len(self.ds_timeslice.time) - self.delay -self.pred_len}")
@@ -201,13 +237,12 @@ class TWSAGraphDataset(Dataset):
         landmask_no_antarctica = (self.land_ocean_mask.where(self.ds_timeslice['lat']>-60)).isel(time=slice(0, temp_dim)).fillna(0).astype('bool').values
            
         if self.scaling_params is not None:
-            self.ds_timeslice = self.ds_timeslice.fillna(self.features_nanfill)
+            # NaNs are filled after normalization and masking (see below), the same order as in
+            # the training branch, so that a NaN inside the valid mask is encoded identically
             for i, var in enumerate(self.input_vars):
                 try:
                     assert var == self.scaling_params[i][0].name
                     assert var == self.scaling_params[i][1].name
-                    if  var == 'ro': # for precipitation and runoff we want to do a log transformation before normalizing to make the distribution less skewed, we add a small value to avoid taking the log of zero
-                        self.ds_timeslice[var] =self.ds_timeslice[var].clip(min=0)
                     self.ds_timeslice[var] = (self.ds_timeslice[var] - self.scaling_params[i][0]) / self.scaling_params[i][1]
                 except (AssertionError, AttributeError): print(f"Variable {var} not found in scaling parameters, skipping normalization")
                 
@@ -224,7 +259,6 @@ class TWSAGraphDataset(Dataset):
                 self.ds_timeslice[var] = self.ds_timeslice[var].fillna(self.features_nanfill)
         
         else:
-            epsilon=1e-6
             scaling_mean_std =[]
             for var in self.input_vars:
                 if var in self.only_land_variables:
@@ -240,16 +274,14 @@ class TWSAGraphDataset(Dataset):
                     mask = np.ones_like(mask_land).astype('bool')
                 with warnings.catch_warnings():
                     warnings.simplefilter("ignore", category=RuntimeWarning)
-                    if  var == 'ro': 
-                        self.ds_timeslice[var] =self.ds_timeslice[var].clip(min=0) # runoff below 0 is unphysical
-
-                  
                     # Compute mean and std for normalization over time per pixel
                     ds_mean = self.ds_timeslice[var].where(mask).mean(dim='time')
                     ds_std = self.ds_timeslice[var].where(mask).std(dim='time')
 
-                    epsilon = float(ds_std.median() * 0.1)
-                    ds_std = ds_std.where(ds_std.values>=epsilon, other=1) # make sure not too small otherwise numerical instability will happen
+                    # clamp the divisor: a pixel with a std below the floor is attenuated
+                    # (its normalized std becomes std/epsilon < 1), never amplified
+                    epsilon = float(ds_std.median() * 0.01)
+                    ds_std = ds_std.clip(min=epsilon)
 
                 self.ds_timeslice[var] = (self.ds_timeslice[var]- ds_mean) / ds_std
                 self.ds_timeslice[var].values[~mask] = 0 #self.ds_timeslice[var].where(~mask, 0).fillna(self.features_nanfill)
@@ -291,13 +323,17 @@ class TWSAGraphDataset(Dataset):
                     ),  # (num_lat, num_long)
                 ),axis=2, )  # (num_lon*num_lat, 2)
 
+        # materialize the (num_features, num_time_steps, num_lat, num_lon) array once and index
+        # it for both masks, instead of building it separately for land and for ocean
+        all_features = self.ds_timeslice.to_dataarray().values
+
         # Get the land grid cells
         land_coords = grid_lon_lat[land_sea_mask[0]] # index 0 to get the first time step, lat_lon grid has no time component
-        land_features = self.ds_timeslice.to_dataarray().values[:,land_sea_mask] # (num_features, num_time_steps*num_lat_lon)
+        land_features = all_features[:,land_sea_mask] # (num_features, num_time_steps*num_lat_lon)
         land_features = land_features.reshape( num_features, num_timesteps, -1) # (num_features, num_time_steps,  number of land grid cells)
         # Do the same for the ocean grid cells
         ocean_coords = grid_lon_lat[~land_sea_mask[0]] # index 0 to get the first time step, lat_lon grid has no time component
-        ocean_features = self.ds_timeslice.to_dataarray().values[:,~land_sea_mask] # (num_features, num_time_steps*num_lat_lon)
+        ocean_features = all_features[:,~land_sea_mask] # (num_features, num_time_steps*num_lat_lon)
         ocean_features = ocean_features.reshape(num_features, num_timesteps,-1) # (num_features, num_time_steps,  number of ocean grid cells)
 
         # check if the land and ocean nodes sum up to the total number of grid cells
@@ -306,24 +342,25 @@ class TWSAGraphDataset(Dataset):
         
         return (land_coords, land_features), (ocean_coords, ocean_features), list(self.ds_timeslice.data_vars)
     
-    def cluster_pixels(self, pixels, var_list, num_timesteps, vars_for_cluster=None, 
-                       predefined=None, pixel_type='ocean'):
-        
-        
-        # prepare the inputs for the clustering
-        k_means_input = self.prepare_inputs_clustering(pixels, vars_for_cluster)
-        
-              
-        if self.ocean_clustering is not None: 
-            print('Using predefined clustering model') 
-            
-            
-        elif self.graph_path is not None:          
-            try: 
+    def cluster_pixels(self, pixels, var_list, num_timesteps,
+                       pixel_type='ocean'):
+
+
+        assert self.graph_path is not None, "a graph_path is required to cache the clustering model and save the cluster plot"
+
+        if self.ocean_clustering is not None:
+            print('Using predefined clustering model')
+            assert len(self.ocean_clustering) == len(pixels[0]), \
+                f"predefined clustering has {len(self.ocean_clustering)} labels, expected one per ocean pixel ({len(pixels[0])})"
+        else:
+            # prepare the inputs for the clustering, only needed to fit or apply a clustering model
+            k_means_input = self.prepare_inputs_clustering(pixels)
+            try:
                 with open(self.graph_path+f"/{pixel_type}_clustering_model_{self.num_ocean_clusters}.pkl", "rb") as f:
                     pipe = pickle.load(f)
-                
-            except (FileNotFoundError, TypeError):
+                log_cache_hit(self.graph_path+f"/{pixel_type}_clustering_model_{self.num_ocean_clusters}.pkl")
+
+            except FileNotFoundError:
                 print('Error could not load clustering model, creating a new one')
         
                 pipe = Pipeline([
@@ -338,18 +375,6 @@ class TWSAGraphDataset(Dataset):
                 with open(self.graph_path+f"/{pixel_type}_clustering_model_{self.num_ocean_clusters}.pkl", "wb") as f:
                     pickle.dump(pipe, f)
                             # Get the cluster labels for each ocean grid cell
-            self.ocean_clustering = pipe.predict(k_means_input)
-        else: 
-            print('No path for clustering model. Creating a new one')
-            pipe = Pipeline([
-                ('scaler', StandardScaler()),
-                ('kmeans', KMeans(n_clusters=self.num_ocean_clusters, random_state=42))
-            ])
-            pipe.fit(k_means_input)  
-            self.graph_path = "graphs/heterograph/newgraph"+ f"_{datetime.now().strftime('%m-%d-%Y_%H:%M:%S')}"
-            print('num iterations:', pipe['kmeans'].n_iter_)
-            print('number of clusters:', len(np.unique(pipe['kmeans'].labels_)))
-            # Get the cluster labels for each ocean grid cell
             self.ocean_clustering = pipe.predict(k_means_input)
             
    
@@ -371,73 +396,70 @@ class TWSAGraphDataset(Dataset):
         
         for cluster in range(self.num_ocean_clusters):
             cluster_mask = (self.ocean_clustering == cluster)
-            # Create MultiPoint from all points in cluster
-            cluster_points = MultiPoint([Point(x, y) for x, y in ocean_coords[cluster_mask]])
-            # Get true centroid
-            centroid = cluster_points.centroid
-            coarsened_coords[cluster] = np.array([centroid.x, centroid.y])
-            #coarsened_coords[cluster] = ocean_coords[cluster_mask].mean(axis=0)
+            # the clusters are fitted on the unit sphere and can cross the antimeridian or surround
+            # a pole, where a lon/lat mean lands on the wrong side of the globe
+            coarsened_coords[cluster] = self.spherical_mean(ocean_coords[cluster_mask])
             coarsened_features[:,:, cluster] = ocean_features[:,:, cluster_mask].mean(axis=-1)
         return (coarsened_coords, coarsened_features)# ((num_clusters, 2), (num_features, num_time_steps, num_clusters))
     
-    def prepare_inputs_clustering(self, pixels, vars_for_cluster=['sst']):
-        '''prepare the inputs for the clustering algorithm. per default an embedding of lon lat coordinates are used as features
+    def prepare_inputs_clustering(self, pixels):
+        '''prepare the inputs for the clustering algorithm. The clustering is purely geometric:
+        an embedding of the lon lat coordinates is used as features, the pixel variables are not.
         pixels: tuple of (coords, features) for the grid cells
-        var_list: list of variable to use for the clustering
-        vars_for_cluster: list of variable names to use for the clustering
-        returns: numpy array of shape (num_grid_cells, num_lonlat_embedding + num_variables)'''
-        from scipy.interpolate import NearestNDInterpolator
-        coords, features = pixels
-        # trigonometric embedding of coords to make the clustering invariant to the orientation of the ocean
-        k_means_input = self.trigonometric_embedding(coords)
-        if vars_for_cluster is not None:
-            variables_list = []
-            for var in vars_for_cluster:
-                i = self.input_vars.index(var)
-                # caluclate mean and std of the variable over time
-                var_mean = np.expand_dims(features[i].mean(axis=0), axis=-1) # (num_ocean_grid_cells)
-                var_std = np.expand_dims(features[i].var(axis=0), axis=-1) # (num_ocean_grid_cells)
-                if np.isnan(var_mean).any():
-                    nans = np.isnan(var_mean)
-                    interp = NearestNDInterpolator(coords[~nans[:,0]], var_mean[~nans])
-                    var_mean[nans] = interp(coords[nans[:,0]])
-                if np.isnan(var_std).any():
-                    nans = np.isnan(var_std)
-                    interp = NearestNDInterpolator(coords[~nans[:,0]], var_std[~nans])
-                    var_std[nans] = interp(coords[nans[:,0]])
-                variables_list.append(var_mean)
-                variables_list.append(var_std)
-        
-            # concatenate with the coordinates
-            k_means_input = np.concatenate((k_means_input, *variables_list), axis=1) # (num_ocean_grid_cells, num_grid_embedding_features + num_variables)
-        return k_means_input
+        returns: numpy array of shape (num_grid_cells, num_lonlat_embedding)'''
+        coords, _ = pixels
+        # unit-sphere embedding of coords so that spatial proximity is represented without discontinuities
+        return self.unit_sphere_embedding(coords)
     
 
-    def trigonometric_embedding(self, coords):
-        '''create a trigonometric embedding of the coordinates 
-        coords: numpy array of shape (num_grid_cells, 2) with latitude and longitude
-        returns: list of numpy arrays with the trigonometric embedding of the coordinates'''
-        assert coords.shape[1] == 2, "Coordinates should have shape (num_grid_cells, 2) with latitude and longitude"
-        grid_lat_rad = np.deg2rad(coords[:,0])
-        grid_lon_rad = np.deg2rad(coords[:,1])
+    def unit_sphere_embedding(self, coords):
+        '''create a unit-sphere cartesian embedding of the coordinates
+        coords: numpy array of shape (num_grid_cells, 2) with longitude and latitude (in that order)
+        returns: numpy array of shape (num_grid_cells, 3) with [x, y, z] on the unit sphere.
+        The embedding is injective and chord distance in it is monotone in great-circle distance,
+        so a knn graph over it is a spatial knn graph.'''
+        assert coords.shape[1] == 2, "Coordinates should have shape (num_grid_cells, 2) with longitude and latitude"
+        grid_lon_rad = np.deg2rad(coords[:,0])
+        grid_lat_rad = np.deg2rad(coords[:,1])
         grid_features_list = []
-        grid_features_list.append(np.cos(grid_lat_rad))
-        grid_features_list.append(np.sin(grid_lon_rad))
-        grid_features_list.append(np.cos(grid_lon_rad))
+        grid_features_list.append(np.cos(grid_lat_rad)*np.cos(grid_lon_rad))
+        grid_features_list.append(np.cos(grid_lat_rad)*np.sin(grid_lon_rad))
+        grid_features_list.append(np.sin(grid_lat_rad))
         return np.array(grid_features_list).transpose()
 
+    def spherical_mean(self, coords):
+        '''mean position of the coordinates on the sphere: the mean of their unit-sphere embedding,
+        rescaled onto the sphere. Unlike the mean of lon and lat it does not break for points on
+        both sides of the antimeridian or around a pole.
+        coords: numpy array of shape (num_points, 2) with longitude and latitude (in that order)
+        returns: numpy array of shape (2,) with longitude and latitude of the mean'''
+        x, y, z = self.unit_sphere_embedding(coords).mean(axis=0)
+        # arctan2 only uses the direction of (x, y, z), which rescales the mean onto the sphere
+        return np.rad2deg([np.arctan2(y, x), np.arctan2(z, np.hypot(x, y))])
 
+    def _edge_index_from_knn(self, node_features, k=None):
+        '''Build a k-nearest-neighbour graph over the node features.
+        node_features: array of shape (num_nodes, num_features), or a list of such arrays to concatenate
+        k: number of neighbours, defaults to self.num_neighbours
+        returns: edge_index of shape (2, num_edges) with self loops
+        The features are used as they are: for the unit-sphere coordinates this makes the graph a
+        true spatial knn graph, while standardizing the axes independently would warp the sphere
+        into an ellipsoid and the neighbours would no longer be the great-circle nearest ones.'''
+        from torch_geometric.nn import knn_graph
 
-    def draw_graph(self, edge_index=None, lonlat=None, save_dir=None):
-        if edge_index is None:
-            edge_index=self.edge_index
-        if lonlat is None:
-            lonlat = self.coords
-        f, ax= plot_graph(edge_index, lonlat, title='Graph of the land and ocean grid cells')
-        if save_dir:
-            f.savefig(save_dir)
-        return f, ax
-    
+        if isinstance(node_features, list):
+            node_features = torch.Tensor(np.concatenate(node_features, axis=0))
+        else:
+            node_features = torch.Tensor(node_features)
+
+        if k is None:
+            k = self.num_neighbours
+
+        edge_index = knn_graph(node_features, k=k, loop=True, num_workers=16)
+        edge_index = add_remaining_self_loops(edge_index)[0]
+
+        return edge_index
+
     def get_antarctica_landmask(self):
         """Get a boolean mask for the land grid cells in Antarctica
         Returns:
@@ -453,41 +475,13 @@ class TWSAGraphDataset(Dataset):
 
     def __len__(self):
         return len(self.samples)
-    
-    def __getitem__(self, idx):
-        
-        # get sample
-        t = self.samples[idx]
-        # get features
-        _, land_feats = self.land
-        _, ocean_feats = self.coarse_ocean
-        # concatenate land and ocean features
-
-        input_seq = np.concatenate([land_feats[:,t-self.seq_len:t], ocean_feats[:,t-self.seq_len:t]], axis=-1) # (num_variables, num_time_steps, num grid cells (land+ocean))
-
-        input_seq = np.nan_to_num(input_seq, nan=self.features_nanfill) # fill nans of era5 data with values
-
-        # get target
-        i_target_feat = self.varnames_list.index(self.target)
-        pred_start = t + self.delay
-        pred_end = t + self.delay + self.pred_len
-        target_seq = np.concatenate([land_feats[i_target_feat,pred_start: pred_end], ocean_feats[i_target_feat,pred_start: pred_end]], axis=-1) # (num_variables, num_time_steps, num grid cells (land+ocean))
-        input_seq = torch.Tensor(input_seq).permute(1, 2, 0).float() # ( num_time_steps, num grid cells (land+ocean),num_variables)
-        target_seq = torch.Tensor(target_seq).float()
-        
-        return {
-            # x_sequence has shape
-            'x_sequence': input_seq,   # shape [num_time_steps, num grid cells (land+ocean),num_variables]        
-            'y_timestep': target_seq, # shape [num_pred_time_steps, num grid cells (land+ocean)]
-            'edge_index': self.edge_index.float(), 
-        }
 
 class TWSAGraphHeteroData(TWSAGraphDataset):
     '''This class inherits from TWSAGraphDataset and creates a HeteroData object to store the features, edge indices, 
     and edge features for the land, ocean, and mesh nodes. 
     The mesh nodes represent the hydrobasins and ocean clusters, and the edges between the nodes are created based 
     on the spatial relationships between the grid cells and the hydrobasins/ocean clusters. 
-    The features for the mesh nodes are initialized as the trigonometric embedding of their coordinates.'''
+    The features for the mesh nodes are initialized as the unit-sphere embedding of their coordinates.'''
     def __init__(self, ds, time_period, ocean_clustering=None,
                  num_ocean_clusters=20,
                  land_clustering=None,
@@ -500,9 +494,13 @@ class TWSAGraphHeteroData(TWSAGraphDataset):
                  land_ocean_mask=None, 
                  features_nanfill=-1.,
                  graph_path=None,
-                 train_val_test_data='train'):
-        
-        super(TWSAGraphHeteroData, self).__init__(ds, time_period, 
+                 train_val_test_data='train',
+                 use_ocean_nodes=True,
+                 local_ocean_coupling=False,
+                 twsa_climatology=None,
+                 era5_climatology=None):
+
+        super(TWSAGraphHeteroData, self).__init__(ds, time_period,
                                                  ocean_clustering=ocean_clustering,
                                                  num_ocean_clusters=num_ocean_clusters,
                                                  land_clustering=land_clustering,
@@ -514,7 +512,11 @@ class TWSAGraphHeteroData(TWSAGraphDataset):
                                                  land_ocean_mask=land_ocean_mask, #land_pixel_threshold=land_pixel_threshold,
                                                  features_nanfill=features_nanfill,
                                                  graph_path=graph_path,
-                                                 train_val_test_data=train_val_test_data)
+                                                 train_val_test_data=train_val_test_data,
+                                                 use_ocean_nodes=use_ocean_nodes,
+                                                 local_ocean_coupling=local_ocean_coupling,
+                                                 twsa_climatology=twsa_climatology,
+                                                 era5_climatology=era5_climatology)
         # create the HeteroData object to store features, edge_indices, and edge_features
         self.data = pyg.data.HeteroData()
         self.time_period = time_period
@@ -524,18 +526,20 @@ class TWSAGraphHeteroData(TWSAGraphDataset):
         self.hydro_basins = self.hydro_basins[self.hydro_basins['HYBAS_ID'].isin(self.land_to_basin_ids.unique())].reset_index()
         
        
-        self.hydro_basins['basin_centroid'] = self.hydro_basins.geometry.centroid 
+        self.hydro_basins['basin_centroid'] = self.basin_centroids(self.land[0], self.land_to_basin_ids, self.hydro_basins['HYBAS_ID'])
         
         self.data['grid'].node_index = np.arange(len(self.land[0])) # (num_grid_cells, 1)
-        self.data['ocean'].node_index = np.arange(len(self.coarse_ocean[0])) # (num_ocean_clusters, 1)
+        if self.use_ocean_nodes:
+            self.data['ocean'].node_index = np.arange(len(self.coarse_ocean[0])) # (num_ocean_clusters, 1)
         self.data['mesh'].node_index = np.arange(len(self.hydro_basins)+len(self.coarse_ocean[0]))
-        self.data['mesh'].x = self._init_mesh_features(self.hydro_basins['basin_centroid'].values, self.coarse_ocean[0]) # (num_mesh_cells, 3) trigonometric embedding
+        self.data['mesh'].x = self._init_mesh_features(self.hydro_basins['basin_centroid'].values, self.coarse_ocean[0]) # (num_mesh_cells, 3) unit-sphere embedding
         
 
-        self.data['grid', 'to', 'mesh'].edge_index = self._init_pixelbasin_edgeindex(self.land_to_basin_ids, len(self.coarse_ocean[0]))
+        self.data['grid', 'to', 'mesh'].edge_index = self._init_pixelbasin_edgeindex(self.land_to_basin_ids)
         self.data['grid', 'to', 'mesh'].edge_attr = torch.ones(self.data['grid', 'to', 'mesh'].edge_index.shape[1]) # (num_grid_cells, 1)
-        self.data['ocean', 'to', 'mesh'].edge_index = torch.from_numpy(np.vstack([self.data['ocean'].node_index, self.data['mesh'].node_index[-self.num_ocean_clusters:]])).long()
-        self.data['ocean', 'to', 'mesh'].edge_attr = torch.ones(self.data['ocean', 'to', 'mesh'].edge_index.shape[1]) # (num_ocean_clusters, 1)
+        if self.use_ocean_nodes:
+            self.data['ocean', 'to', 'mesh'].edge_index = torch.from_numpy(np.vstack([self.data['ocean'].node_index, self.data['mesh'].node_index[-self.num_ocean_clusters:]])).long()
+            self.data['ocean', 'to', 'mesh'].edge_attr = torch.ones(self.data['ocean', 'to', 'mesh'].edge_index.shape[1]) # (num_ocean_clusters, 1)
         self.data['mesh', 'to', 'mesh'].edge_index, self.data['mesh', 'to', 'mesh'].edge_attr = self._init_basinbasin_edges(k=k_mesh2mesh)
         
 
@@ -553,10 +557,11 @@ class TWSAGraphHeteroData(TWSAGraphDataset):
             lc = np.array(df[['lon', 'lat']].values)
             assert np.allclose(lc, self.land[0], atol=1e-5), "Coordinates do not match with the hydrobasin coordinates"
             self.land_to_basin_ids = df['HYBAS_ID'].astype('int64')
-            
+            log_cache_hit(self.graph_path+'/landpoints_to_basin.csv')
+
         except (FileNotFoundError, AssertionError):    
             
-            self.land_to_basin_ids, na_basin_gdf, joined_df = self.assign_hydrobasins(self.land[0], self.hydro_basins.copy())
+            self.land_to_basin_ids, joined_df = self.assign_hydrobasins(self.land[0], self.hydro_basins.copy())
             coords = np.array([[geom.x, geom.y] for geom in joined_df['geometry'].values])
             
             joined_df[['lon', 'lat']] = pd.DataFrame(coords, index=joined_df.index)
@@ -565,13 +570,12 @@ class TWSAGraphHeteroData(TWSAGraphDataset):
         return self.land_to_basin_ids
     
     def assign_hydrobasins(self, coords, gdf):            
-            ''' finds the hydrobasin for every grid cell on land 
-                puts all the not assignable basins into extra geodataframe
+            ''' finds the hydrobasin for every grid cell on land
+                puts all the not assignable points into the artificial basin 1030099999
                 (points in antarctica and hawaii can not be assigned since hydrobasins are not defined there)
             Args: coords: coordinates of the land grid cells
                     gdf: geodataframe of the hydrobasins
-            Returns: basin_ids: list of basin IDs for the input coords, 
-                        na_gdf: artificial basin for all the grid points that could not be assigend (with centroid and HYBAS_ID)
+            Returns: basin_ids: list of basin IDs for the input coords,
                         joined: GeoDataFrame of land coords (points) and basin ID
             '''
             points = [Point(lon, lat) for lon, lat in coords]
@@ -580,19 +584,20 @@ class TWSAGraphHeteroData(TWSAGraphDataset):
             gdf_split = self.handle_dateline_crossing(gdf)
             # Perform spatial join to find nearest basin for each point
             joined = gpd.sjoin_nearest(points_gdf, gdf_split, how='left', max_distance=0.1)
+            # a point equidistant from two basins gets one row per basin, which would make the
+            # result longer than the input points - keep the first match so that there is
+            # exactly one basin per point
+            joined = joined[~joined.index.duplicated(keep='first')]
 
             # deal with points that could not be assigned (these are in antarctica and hawaii)
+            # 1030099999 is the artificial basin they all get - it already exists in
+            # hydrosheds_basins.shp as a degenerate polygon at (90, -80), too far from any
+            # point for max_distance=0.1 to match, so this fallback is what assigns it
             na_mask = joined['HYBAS_ID'].isna()
-            # create row for hydrobasin dataframe with extra basin for all the points that could not be assigned 
-            na_gdf = gpd.GeoDataFrame({
-                                'HYBAS_ID': [1030099999],  # Special ID made up for the 'new' basin
-                                'basin_centroid': [Point(90, -80.0)] # centroid of antarctica as found on wikipedia
-                            }, crs=gdf.crs)
-            
-            joined.loc[na_mask, 'HYBAS_ID'] = 1030099999 
-            
-            basin_ids = joined['HYBAS_ID'].astype('int64')	
-            return basin_ids, na_gdf, joined
+            joined.loc[na_mask, 'HYBAS_ID'] = 1030099999
+
+            basin_ids = joined['HYBAS_ID'].astype('int64')
+            return basin_ids, joined
     
     def handle_dateline_crossing(self, gdf):
         # Handle dateline crossing by splitting polygons at dateline
@@ -641,6 +646,15 @@ class TWSAGraphHeteroData(TWSAGraphDataset):
                 gdf_split.loc[idx, 'geometry'] = shapely.MultiPolygon(all_polys)
         return gdf_split
 
+    def basin_centroids(self, land_coords, land_to_basin_ids, basin_ids):
+        '''position of every basin: the spherical mean of the land grid cells assigned to it
+        Args: land_coords: numpy array of shape (num_land_grid_cells, 2) with longitude and latitude
+              land_to_basin_ids: basin ID of every land grid cell
+              basin_ids: basin IDs in mesh node order, each assigned to at least one land grid cell
+        Returns: list of shapely Points (lon, lat), one per basin'''
+        land_to_basin_ids = np.asarray(land_to_basin_ids)
+        return [Point(*self.spherical_mean(land_coords[land_to_basin_ids == bid])) for bid in basin_ids]
+
     def get_mesh_coords(self):
         '''Get the coordinates of the mesh nodes'''
         hydro_basin_coords = np.array([[geom.x, geom.y] for geom in self.hydro_basins['basin_centroid'].values])
@@ -650,12 +664,12 @@ class TWSAGraphHeteroData(TWSAGraphDataset):
     def _init_mesh_features(self, hydro_basin_centroids, ocean_coords):
         '''Initialize mesh features as the lon and lat of the basin/ocean cluster'''
         hydro_basin_coords = np.array([[geom.x, geom.y] for geom in hydro_basin_centroids])
-        trig_basin = self.trigonometric_embedding(hydro_basin_coords)
-        trig_ocean = self.trigonometric_embedding(ocean_coords)
-        
-        return torch.Tensor(np.concatenate([trig_basin, trig_ocean], axis=0)) 
+        xyz_basin = self.unit_sphere_embedding(hydro_basin_coords)
+        xyz_ocean = self.unit_sphere_embedding(ocean_coords)
+
+        return torch.Tensor(np.concatenate([xyz_basin, xyz_ocean], axis=0))
    
-    def _init_pixelbasin_edgeindex(self, land_to_basin_ids, num_ocean_nodes):
+    def _init_pixelbasin_edgeindex(self, land_to_basin_ids):
         """
         Create edge index connecting points to their basins + connecting ocean nodes to ocean nodes (1 to 1 mapping).
         Some basins have no grid points assinged to them. Some grid points are not assigned to any basin (e.g. in Antarctica).
@@ -666,6 +680,7 @@ class TWSAGraphHeteroData(TWSAGraphDataset):
         try: 
             with open(self.graph_path+"/pixel_basin_edgeindex.pt", "rb") as f:
                 edge_index = torch.load(f, weights_only=True)
+            log_cache_hit(self.graph_path+"/pixel_basin_edgeindex.pt")
         except (FileNotFoundError, TypeError):
             print("Calculating edge index for pixel to basin mapping")
             # Get point indices and basin indices
@@ -694,22 +709,43 @@ class TWSAGraphHeteroData(TWSAGraphDataset):
         try: 
             with open(self.graph_path+f"/basin_basin_edgeindex{k}.pt", "rb") as f:
                 edgeindex = torch.load(f, weights_only=True)
+            log_cache_hit(self.graph_path+f"/basin_basin_edgeindex{k}.pt")
         except (FileNotFoundError, TypeError):
             print("Calculating edge index for basin to basin mapping")
             
             if k==0:
-                # fully connected graph 
+                # fully connected mesh graph 
                 edgeindex = torch.tensor([[i, j] for i in range(self.data['mesh'].x.shape[0]) for j in range(self.data['mesh'].x.shape[0])]).t()
             else:
                 # calculate the edge index from the knn graph of the basin centroids
-                trig_coords = self.data['mesh'].x.numpy() 
-                knn_edgeindex = self._edge_index_from_knn(trig_coords,k) 
-                ocean_edgeindex = torch.tensor([[i, j] for i in np.arange(self.data['mesh'].x.shape[0]-len(self.coarse_ocean[0]), self.data['mesh'].x.shape[0]) for j in range(self.data['mesh'].x.shape[0])]).t()
-
-                edgeindex = torch.cat([knn_edgeindex, ocean_edgeindex], dim=1) 
-                torch.save(edgeindex, self.graph_path+f"/basin_basin_edgeindex{k}.pt")
+                xyz_coords = self.data['mesh'].x.numpy()
+                edgeindex = self._edge_index_from_knn(xyz_coords,k)
+                if self.use_ocean_nodes:
+                    edgeindex = torch.cat([edgeindex, self._ocean_mesh_edges()], dim=1)
+            torch.save(edgeindex, self.graph_path+f"/basin_basin_edgeindex{k}.pt")
         edge_attr = torch.ones(edgeindex.shape[1])
         return edgeindex, edge_attr
+
+    def _ocean_mesh_edges(self, num_nearest=3):
+        '''Outgoing edges of the ocean cluster nodes in the mesh to mesh graph, with the ocean
+        node as source (edge_index[0]).
+        full variant: every ocean node sends to every mesh node.
+        local_ocean variant: each basin only receives from its num_nearest closest ocean clusters,
+        no ocean to ocean edges are added (only those of the knn graph remain). The mesh features are the unit-sphere
+        embedding, where chord distance is monotone in great-circle distance, so the knn over
+        them gives the great-circle nearest clusters.'''
+        num_mesh = self.data['mesh'].x.shape[0]
+        first_ocean = num_mesh - len(self.coarse_ocean[0])
+        ocean_idx = np.arange(first_ocean, num_mesh)
+
+        if not self.local_ocean_coupling:
+            return torch.tensor([[i, j] for i in ocean_idx for j in range(num_mesh)]).t()
+
+        # ocean_ocean = torch.tensor([[i, j] for i in ocean_idx for j in ocean_idx]).t() # connects all ocean nodes to each other
+        xyz = self.data['mesh'].x
+        ocean_basin = pyg.nn.knn(xyz[first_ocean:], xyz[:first_ocean], num_nearest).flip(0)
+        ocean_basin[0] += first_ocean # ocean cluster index to mesh index, row 1 is already the basin index
+        return ocean_basin
 
 
     def _init_basinpixel_edgeindex(self, k=5):
@@ -719,50 +755,17 @@ class TWSAGraphHeteroData(TWSAGraphDataset):
         try: 
             with open(self.graph_path+f"/basin_pixel_edgeindex_knn{k}.pt", "rb") as f:
                 edge_index = torch.load(f, weights_only=True)
+            log_cache_hit(self.graph_path+f"/basin_pixel_edgeindex_knn{k}.pt")
         except (FileNotFoundError, TypeError):
             print("Calculating edge index for basin to pixel mapping")
-            trig_coords_mesh = self.data['mesh'].x.numpy()
-            trig_grid_coords = self.trigonometric_embedding(self.land[0]) 
-            edge_index = pyg.nn.knn(torch.from_numpy(trig_coords_mesh).to(torch.float32), torch.from_numpy(trig_grid_coords).to(torch.float32), k).flip(0)
+            xyz_coords_mesh = self.data['mesh'].x.numpy()
+            xyz_grid_coords = self.unit_sphere_embedding(self.land[0])
+            edge_index = pyg.nn.knn(torch.from_numpy(xyz_coords_mesh[:len(self.hydro_basins)]).to(torch.float32), torch.from_numpy(xyz_grid_coords).to(torch.float32), k).flip(0)
             torch.save(edge_index, self.graph_path+f"/basin_pixel_edgeindex_knn{k}.pt")
         return edge_index
         
     
-    def draw_graph(self, edgename, save_dir=None, edge_index=None, edge_attr=None):
-        vmax=None
-        
-        if edgename == 'gridmesh':
-            if edge_index is None:
-                edge_index = self.data['grid', 'to', 'mesh'].edge_index
-            lonlat = self.coords
-            lonlat_dest = self.data['mesh'].x
-            title = 'Graph of the land grid cells and their corresponding basins'
-            vmax=300 # some basins (basin for not assignable grid cells) will have high degree of connections (grid cells mapping to them)
-            f, ax= plot_graph(edge_index, lonlat, title=title, latlon_dest=lonlat_dest, vmax=vmax, edge_attr=edge_attr)
-            if save_dir:
-                f.savefig(save_dir)
-                plt.close()
-        elif edgename == 'meshmesh':
-            if edge_index is None:
-                edge_index = self.data['mesh', 'to', 'mesh'].edge_index
-            
-            basin_coords = np.array([[geom.x, geom.y] for geom in self.hydro_basins['basin_centroid'].values])
-            lonlat = np.concatenate([basin_coords, self.coarse_ocean[0]], axis=0)
-            lonlat_dest=None
-            title = 'Graph of the basins'
-            plot_graph_3d(basin_coords, edge_index, save_dir)
-        elif edgename == 'meshgrid':
-            if edge_index is None:
-                edge_index = self.data['mesh', 'to', 'grid'].edge_index
-            lonlat = self.data['mesh'].x
-            lonlat_dest = self.coords
-            title = 'Graph of the basins and their corresponding grid cells'
-            f, ax= plot_graph(edge_index, lonlat, title=title, latlon_dest=lonlat_dest, vmax=vmax, edge_attr=edge_attr)
-            if save_dir:
-                f.savefig(save_dir)
-                plt.close()
-        else:
-            raise ValueError("Unknown edge name. Use 'gridmesh' or 'meshmesh'")
+    
    
     def _get_greenland_basins(self):
         basin_id_list = [9030013780,9030000010,	9030010370,	9030005280]
@@ -784,23 +787,27 @@ class TWSAGraphHeteroData(TWSAGraphDataset):
     
 
     def __getitem__(self, idx):
-        # clone the graph to get all the edges and hierarchical layers
-        data_chunk = self.data.clone() 
+        # shallow copy: the sample gets its own attribute dicts but shares the edges and mesh
+        # positions with self.data, which are identical for every sample. Safe because the
+        # sample only rebinds x/y and no consumer writes into a graph tensor in place.
+        data_chunk = copy.copy(self.data)
 
         # get sample
         t = self.samples[idx]
         # get features
         input_seq = self.features[:,t-self.seq_len:t] # shape  [grid cells (land), num_time_steps, num_variables]
-        ocean_input_seq = self.ocean_features[:,t-self.seq_len:t] # shape  [num_ocean_clusters, num_time_steps,  num_variables]
         # get target
         pred_start = t + self.delay
         pred_end = t + self.delay + self.pred_len
-        target_seq = self.target[:, pred_start: pred_end] # shape [grid cells (land), num_time_steps]
+        target_seq = self.target_series[:, pred_start: pred_end] # shape [grid cells (land), num_time_steps]
 
         data_chunk['grid'].x = input_seq
-        data_chunk['ocean'].x = ocean_input_seq
+        if self.use_ocean_nodes:
+            data_chunk['ocean'].x = self.ocean_features[:,t-self.seq_len:t] # shape  [num_ocean_clusters, num_time_steps,  num_variables]
         data_chunk['grid'].y = target_seq
-        
+        if self.twsa_offset is not None:
+            data_chunk['grid'].twsa_offset = self.twsa_offset[:, pred_start: pred_end] # C of the target months, added back in predict_step
+
         return data_chunk
     
 
@@ -815,7 +822,8 @@ class DummyDataset(TWSAGraphHeteroData):
     def __getitem__(self, idx):
         data_chunk = super().__getitem__(idx)
         data_chunk['grid'].x = torch.ones(data_chunk['grid'].x.shape)
-        data_chunk['ocean'].x = torch.ones(data_chunk['ocean'].x.shape)
+        if self.use_ocean_nodes:
+            data_chunk['ocean'].x = torch.ones(data_chunk['ocean'].x.shape)
 
         return data_chunk
 

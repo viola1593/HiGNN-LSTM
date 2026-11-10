@@ -7,13 +7,14 @@ import os
 import pandas as pd
 import pytorch_lightning as pl
 import torch
-import torchmetrics
 from typing import Any, Dict
 import xarray as xr
-import yaml
 
 from datamodules.TWSA_heterograph_datamodule import TWSA_HeteroGraphDatamodule
 from models.pl_hmmodel import HMModule
+from utils.eval_metrics import (_corr, _lat_weighted_rmse, _rmse, get_basin_wide_mean_twsa,
+                                get_climatology, get_months_output_sequences,
+                                mask_coverage, recover_month_index, valid_mask)
 from utils.utils import read_config, save_config
 
 
@@ -35,7 +36,19 @@ TEST_BASIN_IDS = { # Basin name : Basin ID
                     "Ganges": 4030025450, # AS
                     "Indus": 4030033640, # AS
                     "Murray": 5030073410 # AUS
-                  } 
+                  }
+
+# predicted months covered by the comparison (Li et al. initialisations 2019-10 to 2023-05)
+COMPARISON_PERIOD = ('2019-11', '2023-11')
+
+
+def select_comparison_window(first_target_times, output_seq_len=6, period=COMPARISON_PERIOD):
+    """Mask of the samples whose predicted months all lie in `period`, and the Li et al.
+    initialisation (the month before the first prediction) of each kept sample."""
+    first = np.asarray(first_target_times).astype('datetime64[M]')
+    keep = (first >= np.datetime64(period[0])) & (first + output_seq_len - 1 <= np.datetime64(period[1]))
+    inits = [str(m - 1) for m in first[keep]]
+    return keep, inits
 
 
 
@@ -60,8 +73,9 @@ def create_experiment_dir(config: Dict[str, Any], dataset: str="test") -> str:
     Returns:
         config with updated save_dir
     """
-    exp_dir_path = os.path.join(f"eval_on_full{dataset}", config["experiment"]["save_dir"])
+    exp_dir_path = os.path.join(config["experiment"]["save_dir"], f"compare_to_fcast")
     os.makedirs(exp_dir_path, exist_ok=True)
+    os.makedirs(os.path.join(exp_dir_path, "BasinPlots"), exist_ok=True)
     config["experiment"]["save_dir"] = exp_dir_path
     
     return config
@@ -75,8 +89,9 @@ def create_experiment_dir(config: Dict[str, Any], dataset: str="test") -> str:
 
 
 
-def plot_basintwsa_timesteps(name, id, pred, true, fupeng,  ax, fontsize=14):
-    ''' pred shape [B, T], true shape [B, T], fupeng shape [B, T]
+def plot_basintwsa_timesteps(name, id, pred, true, fupeng,  ax, clim, fontsize=14):
+    ''' pred shape [B, T], true shape [B, T], fupeng shape [B, T], clim shape [B, T] (training climatology
+    of the predicted months, subtracted from all three for the anomaly correlation)
     Colors sequences with gradient from light to dark blue based on lead time (1-6)
     '''
     # Font size control - adjust these variables to change all text sizes
@@ -120,17 +135,20 @@ def plot_basintwsa_timesteps(name, id, pred, true, fupeng,  ax, fontsize=14):
     
     # Calculate metrics
     
-    pred_tensor = torch.tensor(pred, dtype=torch.float32).squeeze().permute(1,0) # [B, T]
-    true_tensor = torch.tensor(true, dtype=torch.float32).squeeze().permute(1,0)
-    fupeng_tensor = torch.tensor(fupeng, dtype=torch.float32).squeeze().permute(1,0)
-    _corr = torchmetrics.PearsonCorrCoef(num_outputs=pred.shape[0])
-    rmse_pred = _rmse(pred_tensor, true_tensor).mean()
-    corr_pred = _corr(pred_tensor, true_tensor).mean()
-    rmse_fup = _rmse(fupeng_tensor, true_tensor).mean()
-    corr_fup = _corr(fupeng_tensor, true_tensor).mean()
-    
+    pred_tensor = torch.tensor(pred, dtype=torch.float32).squeeze()  # [B, T]
+    true_tensor = torch.tensor(true, dtype=torch.float32).squeeze()
+    fupeng_tensor = torch.tensor(fupeng, dtype=torch.float32).squeeze()
+    clim_tensor = torch.tensor(clim, dtype=torch.float32).squeeze()
+    # _rmse reduces dim=1, so the windows go there: one RMSE per lead, then the mean
+    # over the leads. _corr takes the windows on dim=0 and returns one r per lead --
+    # correlating the 6 leads inside a window instead is blind to the window's level.
+    rmse_pred = _rmse(pred_tensor.permute(1, 0), true_tensor.permute(1, 0)).mean()
+    corr_pred = _corr(pred_tensor - clim_tensor, true_tensor - clim_tensor).mean()
+    rmse_fup = _rmse(fupeng_tensor.permute(1, 0), true_tensor.permute(1, 0)).mean()
+    corr_fup = _corr(fupeng_tensor - clim_tensor, true_tensor - clim_tensor).mean()
+
     # Add metrics text on the plot
-    metrics_text = (f'r={corr_pred:.2f}/{corr_fup:.2f}\n'
+    metrics_text = (f'$r_{{anom}}$={corr_pred:.2f}/{corr_fup:.2f}\n'
                     f'RMSE={rmse_pred:.2f}/{rmse_fup:.2f} cm')
     ax.text(0.98, 0.02, metrics_text, transform=ax.transAxes, fontsize=fontsize_text,
             verticalalignment='bottom', horizontalalignment='right',
@@ -160,13 +178,10 @@ def plot_leadtimes_meantwsa(fupeng, pred, true, save_dir=None):
         if i ==0:
             ax[i].plot(x, t, label='True', color='black', marker='o')
             ax[i].plot(x, p, label='HiGNN-LSTM', color = 'b',  linewidth=linewidth)
-            #ax.plot(x, c, label='Climatology', linestyle='dotted', color='gray', linewidth=linewidth*2)
             ax[i].plot(x, f, label='Fupeng et al.', color = 'r',  linewidth=linewidth)
         else:
-            i = i % 6
             ax[i].plot(x, t,  color='black', marker='o')
             ax[i].plot(x, p, color = 'b', linewidth=linewidth, )
-            #ax.plot(x, c, linestyle='dotted', color='gray', linewidth=linewidth*2)
             ax[i].plot(x, f, color = 'r',  linewidth=linewidth)
         ax[i].grid(True, which='both', axis='both', linestyle='--', color='gray', alpha=0.7)
         ax[i].set_title(f'{i+1} months lead')
@@ -180,20 +195,17 @@ def plot_leadtimes_meantwsa(fupeng, pred, true, save_dir=None):
 
 
 def build_model_from_checkpoint(experiment_path, config, gpu, twsa_sequence_data):
-    # Recursively search for .ckpt files in all subfolders
-    ckpt_files = glob.glob(os.path.join(experiment_path, "**", "*.ckpt"), recursive=True)
-    
-    if ckpt_files:
-        # Use the latest checkpoint (by modification time)
-        latest_ckpt = min(ckpt_files, key=os.path.getmtime)
-        print(f"Found checkpoint: {latest_ckpt}")
-    else:
-        print("No checkpoint found.")
-        return None
+    # the best-val_rmse checkpoint is the only .ckpt in the experiment dir besides last.ckpt
+    ckpt_files = [p for p in glob.glob(os.path.join(experiment_path, "*.ckpt"))
+                  if os.path.basename(p) != "last.ckpt"]
+    assert len(ckpt_files) == 1, f"expected one best-val_rmse ckpt in {experiment_path}, got {ckpt_files}"
+    best_ckpt = ckpt_files[0]
+    print(f"Loading best-val_rmse checkpoint: {best_ckpt}")
     #load model from checkpoint
-    model = HMModule.load_from_checkpoint(latest_ckpt, **config["model"], 
+    model = HMModule.load_from_checkpoint(best_ckpt, **config["model"],
                                           num_input_features=twsa_sequence_data.num_features,
                                           num_ocean_features=twsa_sequence_data.num_ocean_features,
+                                            use_ocean_nodes=twsa_sequence_data.use_ocean_nodes,
                                             sequence_length=twsa_sequence_data.input_seq_len,
                                             output_seq_len=twsa_sequence_data.target_seq_len, 
                                             land_sea_mask=None,
@@ -203,7 +215,7 @@ def build_model_from_checkpoint(experiment_path, config, gpu, twsa_sequence_data
     model.model_summary()
     return model
 
-def get_predictions(twsa_sequence_data, trainer, config, dataset='test', gpu=0):
+def get_predictions(twsa_sequence_data, trainer, config, experiment_path, dataset='test', gpu=0):
     if dataset == "test":
         dataloader_pred = twsa_sequence_data.predict_dataloader(period=twsa_sequence_data.train_val_test_periods['test'])
     elif dataset == "val":
@@ -217,147 +229,34 @@ def get_predictions(twsa_sequence_data, trainer, config, dataset='test', gpu=0):
     try:
         predictions = torch.load(os.path.join(config["experiment"]["save_dir"],"predictions.pt"))
     except FileNotFoundError:
-        model = build_model_from_checkpoint(config["experiment"]["save_dir"], config, gpu, twsa_sequence_data)
+        # the checkpoint lives in the training experiment dir, not in the evaluation output dir
+        model = build_model_from_checkpoint(experiment_path, config, gpu, twsa_sequence_data)
 
-        trainer.test(model, twsa_sequence_data)
-        # test before prediction important so trainer has access to datamodules unnormalization during prediction
+        # no trainer.test needed first: evaluate() assigns trainer.datamodule, which predict_step unnormalizes through
         predictions = trainer.predict(model, dataloader_pred) # predict usually selects val time period
         torch.save(predictions, os.path.join(config["experiment"]["save_dir"],"predictions.pt"))
     return predictions
 
 
-def recover_month_index(month_sin, month_cos):
-    # shape: [B, T]
-    angle = torch.atan2(month_sin, month_cos)  # range: [-π, π]
-    month_float = (angle % (2 * np.pi)) * 12 / (2 * np.pi)  # range: [0, 12)
-    month_index = month_float.long()  # round down to nearest integer (0–11)
-    return month_index
-
-
-def compute_climatology(data: xr.DataArray, lsm):
-    # y_true: [B, N, T], months: [B, T]
-    """Compute climatology from the dataset."""
-    climatology = data.groupby('time.month').mean(dim='time').values  # [12, N]
-    land_clim = climatology[lsm[:12]].reshape(12, -1)
-
-    return land_clim  # [12, Num land nodes]
-
-def get_climatology(twsa_sequence_data, config):
-    # compute climatology from training data
-    try: 
-        climatology = torch.load(os.path.join(config["experiment"]["save_dir"],"climatology.pt"))
-    except FileNotFoundError:
-        twsa_train = twsa_sequence_data.unnormalize_twsa(twsa_sequence_data.data_train.ds_timeslice['twsa'])
-        climatology = compute_climatology(twsa_train, 
-                                            twsa_sequence_data.data_train.land_ocean_mask)
-        torch.save(climatology, os.path.join(config["experiment"]["save_dir"],"climatology.pt"))
-    return climatology
-
-
-def basin_wide_mean_twsa(y_hat, y_true, climatology, datamodule):
-    """Calculate the basin wide mean TWSA predictions/ground truth per each time step.
-    Should be 238 (includes 1 dummy basin for hawaii) basins in total.
-    Args:
-        y_hat: predicted values, shape [T, N]
-        y_true: true values, shape [T, N]
-        datamodule: datamodule containing the land_ocean_mask
-    returns:
-        pred_basin_means: predicted basin means, shape [T, N_basins]
-        true_basin_means: true basin means, shape [T, N_basins]
-    """
-    
-    antarctica_mask =  (~datamodule.get_antarctica_landmask())
-    lon, lat = datamodule.data_pred.land[0][:,0], datamodule.data_pred.land[0][:,1]
-    land2basin = datamodule.data_pred.land_to_basin_ids
-    pred_basin_means = []
-    true_basin_means = []
-    climatology_mean = []
-    for pred, true, clim in zip(y_hat, y_true, climatology):
-        df = pd.DataFrame({
-            'lon': lon[antarctica_mask],
-            'lat': lat[antarctica_mask],
-            'twsa_pred': pred,
-            'twsa_true': true,
-            'climatology': clim,
-            'basin': land2basin[antarctica_mask]
-            })
-        groups = df.groupby('basin').mean()
-        
-        pred_basin_means.append(groups['twsa_pred'].values)
-        true_basin_means.append(groups['twsa_true'].values)
-        climatology_mean.append(groups['climatology'].values)
-    pred_basin_means = np.stack(pred_basin_means)  # [T, N]
-    true_basin_means = np.stack(true_basin_means)  # [T, N]
-    climatology_mean = np.stack(climatology_mean)  # [T, N]
-    return pred_basin_means, true_basin_means, climatology_mean, groups.index
-
-
-def _mape(y_hat, y_true):
-    """Calculate Mean Absolute Percentage Error (MAPE) between two tensors."""
-    # Avoid division by zero
-    epsilon = 1e-8
-    return torch.nanmean(torch.abs((y_true - y_hat) / (y_true + epsilon)), dim=1) * 100  # in percentage
-
-def _rmse(y_hat, y_true):
-    """Calculate Root Mean Squared Error (RMSE) between two tensors."""
-    return torch.sqrt(torch.nanmean((y_true - y_hat) ** 2, dim=1))  # RMSE
-
-def _lat_weighted_rmse(y_hat, y_true, lat_weigths):
-    """Calculate Root Mean Squared Error (RMSE) between two tensors."""
-    return torch.sqrt(torch.nanmean((y_true - y_hat) ** 2 * lat_weigths[None, :,None], dim=1))  # RMSE
-
-def _smape(y_hat, y_true):
-    """Calculate Symmetric Mean Absolute Percentage Error (SMAPE) between two tensors."""
-    # Avoid division by zero
-    epsilon = 1e-8
-    return torch.nanmean(torch.abs(y_true - y_hat) / (torch.abs(y_true) + torch.abs(y_hat) + epsilon), dim=1) * 100  # in percentage
-
-
-
-def get_months_output_sequences(months_input_sequences, output_seq_len):
-    months_output_sequences = [(months_input_sequences[:,:, -1] +i +1)%12 for i in range(output_seq_len)]
-    months_output_sequences = torch.stack([(months_input_sequences[:,:, -1] +i +1)%12 for i in range(output_seq_len)])  # [horizon, Total_B, N]
-    months_output_sequences = months_output_sequences.permute(1,2,0)  # [Total_B, N, horizon]
-    return months_output_sequences  
-
-def get_basin_wide_mean_twsa(twsa_pred, twsa_true, climatology, months_output_sequences, datamodule):
-    # calculate basin-wide mean TWSA for each prediction sequence
-    pred_basin_mean = []
-    true_basin_mean = []
-    basin_mean_climatology = []
-    pred_month = []
-    
-    for (pred, true, months) in zip(twsa_pred, twsa_true, months_output_sequences):
-        pred, true, basin_clim, basin_ids = basin_wide_mean_twsa(pred.permute(1,0),
-                                                                  true.permute(1,0), 
-                                                                  climatology[months[0]], 
-                                                                   datamodule)
-        pred_basin_mean.append(pred)
-        true_basin_mean.append(true)
-        basin_mean_climatology.append(basin_clim)
-        pred_month.append(months[0])
-    pred_basin_mean = np.stack(pred_basin_mean)  # [B, T (horizon), N_basins]
-    true_basin_mean = np.stack(true_basin_mean)  # [B, T(horizon), N_basins]
-    basin_mean_climatology = np.stack(basin_mean_climatology)  # [B, T(horizon), N_basins]
-    pred_months = np.stack(pred_month)  # [B, T(horizon)]
-    
-    return pred_basin_mean, true_basin_mean, basin_mean_climatology, pred_months, basin_ids
-
-
-def evaluate(experiment_path, gpu, dataset="test", 
-             FCast_file_path="data/fupeng_csr_fcast/combined.nc"):
-    """Evaluation Script.
+def evaluate(experiment_path, gpu,
+             FCast_file_path="data/Li_csr_fcast/combined.nc"):
+    """Compares the model with the Li et al. forecast on the GRACE dataset.
     Args:
         experiment_path: path to the experiment directory
         gpu: gpu id to use
-        dataset: dataset name (test or grace)
     """
+    dataset = "grace"
 
     
     pl.seed_everything(42, workers=True)
     config = read_config(os.path.join(experiment_path,  'config.yaml'))
     # exchange devices to given gpu in config
     config['pl']['devices'] = [gpu]
+    # the Li et al. forecast has 6 leads, the month bookkeeping below hardcodes 12 input
+    # months, and get_months_output_sequences puts the first target right after the input
+    assert config['datamodule']['input_seq_len'] == 12, "compare_models hardcodes input_seq_len=12"
+    assert config['datamodule']['output_seq_len'] == 6, "compare_models hardcodes output_seq_len=6 (Li et al. has 6 leads)"
+    assert config['datamodule']['delay'] == 0, "get_months_output_sequences assumes delay=0"
 
     config = create_experiment_dir(config, dataset=dataset)
 
@@ -377,8 +276,7 @@ def evaluate(experiment_path, gpu, dataset="test",
 
     climatology = get_climatology(twsa_sequence_data, config)
      # get list of length num_batches, each element is a tuple of (y_hat, y_true, input_features)
-    predictions = get_predictions(twsa_sequence_data, trainer, config, dataset=dataset, gpu=gpu)
-    time_period = twsa_sequence_data.data_pred.time_period
+    predictions = get_predictions(twsa_sequence_data, trainer, config, experiment_path, dataset=dataset, gpu=gpu)
 
     sample_indices = twsa_sequence_data.data_pred.samples
     timesteps = twsa_sequence_data.data_pred.ds_timeslice.time.values[sample_indices]
@@ -405,44 +303,63 @@ def evaluate(experiment_path, gpu, dataset="test",
 # Prepare data from Li et al. for comparison with our model predictions
 # -------------------------------------------------------------
 
-    dataset = xr.open_dataset(FCast_file_path) # period between nov 2019 - nov 2023
+    ds_fcast = xr.open_dataset(FCast_file_path) # period between nov 2019 - nov 2023
     land_sea_mask = twsa_sequence_data.land_ocean_mask
     land_sea_mask = land_sea_mask[:6]
     
    
-    fcast = [dataset[ts].values[land_sea_mask].reshape(6,-1)[:, antarctica_mask] for ts in dataset][:-6] #last five timesteps are too much (accident data downloading)
+    # variables are named by initialisation date (YYYY-MM); pick the one matching each kept sample
+    keep, inits = select_comparison_window(timesteps, output_seq_len)
+    fcast = [ds_fcast[init].values[land_sea_mask].reshape(6,-1)[:, antarctica_mask] for init in inits]
     fcast = torch.Tensor(np.stack(fcast)).permute(0,2,1) # shape num_pred_seqs, nodes, seq_len
 
 
-    # crop our prediction to fit the time steps of the Li et al. forecast, which starts later than ours (Nov 2019 )
-    starting_idx = 17 # Nov 2019 in our dataset
+    # crop our prediction to the samples predicting Nov 2019 - Nov 2023, the Li et al. comparison period
+    keep_t = torch.from_numpy(keep)
+    twsa_pred = twsa_pred[keep_t]
+    twsa_true = twsa_true[keep_t]
+    timesteps = timesteps[keep]
+    months_output_sequences = months_output_sequences[keep_t]  # else the climatology is off
 
-    twsa_pred = twsa_pred[starting_idx:]
-    twsa_true = twsa_true[starting_idx:]
-    timesteps = timesteps[starting_idx:]
+    # One NaN policy for both tables: a cell is scored only where the target and
+    # *both* models have data, so the gridded scores and the basin means are
+    # computed over identical cells and the two models share one denominator.
+    cell_mask = valid_mask(twsa_pred, fcast, twsa_true)
+    twsa_pred = twsa_pred.masked_fill(~cell_mask, float('nan'))
+    twsa_true = twsa_true.masked_fill(~cell_mask, float('nan'))
+    fcast = fcast.masked_fill(~cell_mask, float('nan'))
+    coverage = mask_coverage(cell_mask).mean(dim=0)  # [horizon]
 
-    pred_basin_mean, true_basin_mean, basin_mean_climatology, pred_months, basin_ids = get_basin_wide_mean_twsa(twsa_pred, twsa_true, climatology, months_output_sequences, twsa_sequence_data)
+    lat_weights = torch.cos(torch.deg2rad(torch.Tensor(twsa_sequence_data.data_train.land[0][:,1][antarctica_mask])))  # [N]
+    # normalize so the weights sum to 1 (avoid changing overall loss scale)
+    lat_weights = lat_weights / (lat_weights.sum() + 1e-12)
+
+    pred_basin_mean, true_basin_mean, clim_basin_mean, pred_months, basin_ids = get_basin_wide_mean_twsa(twsa_pred, twsa_true, climatology, months_output_sequences, twsa_sequence_data, lat_weights=lat_weights)
 
 
 
-    fcast_pred_basin_mean, _, _, _, _ = get_basin_wide_mean_twsa(torch.nan_to_num(fcast), twsa_true, climatology, months_output_sequences, twsa_sequence_data)
+    fcast_pred_basin_mean, _, _, _, _ = get_basin_wide_mean_twsa(fcast, twsa_true, climatology, months_output_sequences, twsa_sequence_data, lat_weights=lat_weights)
 
 
 # --------------------------------------------------------------------------------------------------------------------------------------   
 # calculate metrics - comparison with GRACE from  CSR RL06.03
 # --------------------------------------------------------------------------------------------------------------------------------------   
     
-    metrics_dict = {'rmse': _rmse, 'mape': _mape, 'smape': _smape}
+    metrics_dict = {'rmse': _rmse}
     # get climatology for the predicted months
     clim_pred = torch.Tensor(climatology[pred_months])
-                    
-    clim_per_timestep_scores = [{f'clim_{name}': metric(clim_pred.permute(0, 2, 1), twsa_true).mean(dim=0) for name, metric in metrics_dict.items()}][0]
 
-    fcast_per_timestep_scores = [{f'{name}': metric(fcast, twsa_true).mean(dim=0) for name, metric in metrics_dict.items()}][0]
+    clim_per_timestep_scores = [{f'clim_{name}': metric(clim_pred.permute(0, 2, 1), twsa_true, mask=cell_mask).mean(dim=0) for name, metric in metrics_dict.items()}][0]
+    clim_per_timestep_scores['clim_rmse_latw'] = _rmse(clim_pred.permute(0, 2, 1), twsa_true, mask=cell_mask, lat_weights=lat_weights).mean(dim=0)
+
+    fcast_per_timestep_scores = [{f'{name}': metric(fcast, twsa_true, mask=cell_mask).mean(dim=0) for name, metric in metrics_dict.items()}][0]
+    fcast_per_timestep_scores['coverage'] = coverage
+    fcast_per_timestep_scores['rmse_latw'] = _rmse(fcast, twsa_true, mask=cell_mask, lat_weights=lat_weights).mean(dim=0)
     fcast_basin_scores = [{f'{name}': metric(torch.Tensor(fcast_pred_basin_mean), torch.Tensor(true_basin_mean)).mean(dim=0) for name, metric in metrics_dict.items()}][0]
     fcast_basin_per_timestep_scores = [{f'{name}': metric(torch.Tensor(fcast_pred_basin_mean).permute(2, 0, 1), torch.Tensor(true_basin_mean).permute(2, 0, 1)).mean(dim=0) for name, metric in metrics_dict.items()}][0]
 
-    gnn_per_timestep_scores = [{f'gnn_{name}': metric(twsa_pred, twsa_true).mean(dim=0) for name, metric in metrics_dict.items()}][0]
+    gnn_per_timestep_scores = [{f'gnn_{name}': metric(twsa_pred, twsa_true, mask=cell_mask).mean(dim=0) for name, metric in metrics_dict.items()}][0]
+    gnn_per_timestep_scores['gnn_rmse_latw'] = _rmse(twsa_pred, twsa_true, mask=cell_mask, lat_weights=lat_weights).mean(dim=0)
 
 
     # save scores to csv
@@ -461,21 +378,22 @@ def evaluate(experiment_path, gpu, dataset="test",
 # calculate latitude weighted metrics - comparison with GRACE from  CSR RL06.03
 # --------------------------------------------------------------------------------------------------------------------------------------   
 
-    lat_weights = torch.cos(torch.deg2rad(torch.Tensor(twsa_sequence_data.data_train.land[0][:,1][antarctica_mask])))  # [N]
-    # normalize so the weights sum to 1 (avoid changing overall loss scale)
-    lat_weights = lat_weights / (lat_weights.sum() + 1e-12)
-    lat_weighted_rmse = _lat_weighted_rmse(twsa_pred, twsa_true, lat_weights)
-    lat_weighted_fcast_rmse = _lat_weighted_rmse(fcast, twsa_true, lat_weights)
+    lat_weighted_rmse = _lat_weighted_rmse(twsa_pred, twsa_true, lat_weights, mask=cell_mask)
+    lat_weighted_fcast_rmse = _lat_weighted_rmse(fcast, twsa_true, lat_weights, mask=cell_mask)
     print(f'Latitude weighted RMSE for HiGNN: {lat_weighted_rmse.mean().item():.2f} cm')
     print(f'Latitude weighted RMSE for Li et al.: {lat_weighted_fcast_rmse.mean().item():.2f} cm')
+    # both are summed over the same cells, so both drop the same weight mass
+    retained = (lat_weights[None, :, None] * cell_mask).sum(dim=1)
+    print(f'Retained latitude weight mass: {retained.mean().item():.4f} of 1.0 '
+          f'(cell coverage per lead: {[round(c, 4) for c in coverage.tolist()]})')
 
 # --------------------------------------------------------------------------------------------------------------------------------------   
 # plot global mean 
 # ------------------------------------------------------------- 
     
-    plot_leadtimes_meantwsa(torch.nanmean(fcast, dim=1), 
-                                 torch.mean(twsa_pred, dim=1), 
-                                 torch.mean(twsa_true, dim=1),
+    plot_leadtimes_meantwsa(torch.nanmean(fcast, dim=1),
+                                 torch.nanmean(twsa_pred, dim=1),
+                                 torch.nanmean(twsa_true, dim=1),
                                  save_dir=os.path.join(config["experiment"]["save_dir"], f'GlobalMean_FCastvsGNN.png'))
 
 
@@ -496,9 +414,9 @@ def evaluate(experiment_path, gpu, dataset="test",
         ax = axes_flat[i]
         pred = pred_basin_mean[:,:,basin_ids == id] # shape (B, T)
         true = true_basin_mean[:,:,basin_ids == id]
-        fcast = fcast_pred_basin_mean[:,:,basin_ids == id]
-        plot_basintwsa_timesteps(name, id, pred, true, fcast, 
-                                 ax=ax, fontsize=fontsize)
+        fcast_basin = fcast_pred_basin_mean[:,:,basin_ids == id]
+        plot_basintwsa_timesteps(name, id, pred, true, fcast_basin,
+                                 ax=ax, clim=clim_basin_mean[:,:,basin_ids == id], fontsize=fontsize)
 
                                  
         # start x labels from +1 instead of 0 because of 12 months input 
@@ -520,7 +438,7 @@ def evaluate(experiment_path, gpu, dataset="test",
     text_ax = fig.add_axes([0.76, 0.05, 0.2, 0.02]) 
     text_ax.axis("off")
     text_ax.text( 0.0, 0.5,                          # x=left-aligned, y=vertically centered in axes
-            'r / RMSE = HiGNN-LSTM / Li et al.',
+            '$r_{anom}$ / RMSE = HiGNN-LSTM / Li et al.',
             fontsize=fontsize-2,
             horizontalalignment='left',
             verticalalignment='center',        # center within the 0.02-height axes
@@ -529,7 +447,6 @@ def evaluate(experiment_path, gpu, dataset="test",
         )
   
 
-    # fig.subplots_adjust(bottom=0.08) 
     lead_time_cmap = plt.cm.Blues.reversed() 
     fup_lead_time_cmap = plt.cm.Reds.reversed() 
     sm = plt.cm.ScalarMappable(cmap=lead_time_cmap, norm=plt.Normalize(vmin=1, vmax=6))
@@ -551,7 +468,8 @@ def evaluate(experiment_path, gpu, dataset="test",
     plt.tight_layout(rect=[0, 0.1, 1, 1])
     
     plt.savefig(os.path.join(config["experiment"]["save_dir"], 
-                                                      f'BasinPlots/FCastcomp_lessBasins_leadwise.png'), dpi=300)
+                                                      f'BasinPlots/FCastcomp_lessBasins_leadwise.png'), dpi=300,
+                bbox_inches='tight')  # the r_anom note at the bottom right is wider than the figure
 
          
    
@@ -574,13 +492,11 @@ def start():
         "--gpu", help="GPU device ID", default=0, type=int,
     )
     parser.add_argument(
-        "--dataset", help="Dataset to evaluate on (test, val, or grace)", default="test", type=str)
-    parser.add_argument(
-        "--fcast_file_path", help="Path to the Li et al. forecast file (netcdf format)", default="data/fupeng_csr_fcast/combined.nc", type=str)
+        "--fcast_file_path", help="Path to the Li et al. forecast file (netcdf format)", default="data/Li_csr_fcast/combined.nc", type=str)
 
     args = parser.parse_args()
 
-    evaluate(args.exp_path, gpu=args.gpu, dataset=args.dataset, FCast_file_path=args.fcast_file_path)
+    evaluate(args.exp_path, gpu=args.gpu, FCast_file_path=args.fcast_file_path)
 
 
 if __name__ == "__main__":

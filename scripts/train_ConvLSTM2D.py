@@ -33,7 +33,7 @@ def generate_trainer(config: Dict[str, Any]) -> pl.Trainer:
         **config["pl"],
         default_root_dir=config["experiment"]["save_dir"],
         logger=loggers,
-        callbacks=[checkpoint_callback]
+        callbacks=[checkpoint_callback, pl.callbacks.LearningRateMonitor(logging_interval="epoch")]
         )
 
 
@@ -108,12 +108,13 @@ def plot_explained_variance(y_hat, y_true, datamodule, trainer=None):
         trainer.logger.experiment.log({f'ExpVar': wandb.Image(plt)})
     plt.close() 
 
-def train(config_path):
+def train(config_path, seed=42):
     """Training Script."""
-   
-    
-    pl.seed_everything(42, workers=True)
+
+
     config = read_config(config_path)
+    config["experiment"]["seed"] = seed
+    pl.seed_everything(seed, workers=True)
     config = create_experiment_dir(config)
 
     # generate trainer
@@ -126,6 +127,10 @@ def train(config_path):
     if config["load_checkpoint"]:
         twsa_sequence_data.setup(stage='fit')
         model = ConvLSTMModule.load_from_checkpoint(config["load_checkpoint"], **config["model"])
+
+        trainer.loggers[0].watch(model, log='all')
+
+        trainer.fit(model, datamodule=twsa_sequence_data, ckpt_path=config["load_checkpoint"])
     else:
         # generate model
         model = ConvLSTMModule(**config["model"], kernel_size=(3,3),                             
@@ -164,7 +169,7 @@ def train(config_path):
         
         twsa_pred = preds[0, i].float()
         twsa_true = true[0, i]
-        if i ==0:
+        if i ==0: # in anomaly mode this input is twsa - C, so the first 'Last TWSA' panel shows the anomaly
             last_twsa = input[0, -1, 0] # get last time step of input data
             last_twsa = twsa_sequence_data.unnormalize_twsa(last_twsa)
         else:
@@ -183,10 +188,12 @@ def start():
     )
 
     parser.add_argument("--config_path", help="Path to the config file", required=True)
+    parser.add_argument("--seed", type=int, default=42,
+                        help="Random seed for weight init and shuffling")
 
     args = parser.parse_args()
 
-    train(args.config_path)
+    train(args.config_path, args.seed)
 
 
 if __name__ == "__main__":

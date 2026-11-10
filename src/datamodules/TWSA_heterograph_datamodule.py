@@ -1,5 +1,7 @@
 from typing import Optional, Tuple, Dict
+import json
 import torch
+import warnings
 from pytorch_lightning import LightningDataModule
 from torch.utils.data import  Dataset
 from torch_geometric.loader import DataLoader as pygDataLoader
@@ -8,10 +10,13 @@ import numpy as np
 import xarray as xr
 
 import matplotlib.pyplot as plt
+from pathlib import Path
 try:
     from datamodules.TWSA_heterograph_dataset import TWSAGraphHeteroData
 except ModuleNotFoundError:
     from TWSA_heterograph_dataset import TWSAGraphHeteroData
+
+GRAPH_VARIANTS = ['full', 'no_ocean', 'local_ocean']
 
 
 
@@ -37,13 +42,19 @@ class TWSA_HeteroGraphDatamodule(LightningDataModule):
             k_mesh2grid=1,
             log_transform_target: bool = False, # nonsense for negative values
             train_val_test_split: Tuple[float, float, float] = (0.6, 0.2, 0.2),
-            graph_path=None,
+            graph_variant: str = 'full',
+            graph_embedding_version: str = 'unitsphere_v2',
             num_ocean_clusters: int = 20,
-            **kwargs       
+            twsa_anomaly: bool = False, # models see and predict twsa - C_train[month]
+            era5_anomaly: bool = False, # models see every input except twsa as var - C_train[month]
+            **kwargs
             ):
         super(TWSA_HeteroGraphDatamodule, self).__init__()
 
-   
+        assert 'graph_path' not in kwargs, ("graph_path is derived from graph_variant and "
+                                            "graph_embedding_version, remove it from the config")
+        assert graph_variant in GRAPH_VARIANTS, f"graph_variant must be one of {GRAPH_VARIANTS}, got {graph_variant}"
+
         self.ds_path = ds_path
         self.input_seq_len = input_seq_len
         self.delay = delay
@@ -53,8 +64,15 @@ class TWSA_HeteroGraphDatamodule(LightningDataModule):
         self.k_mesh2grid = k_mesh2grid
         self.train_val_test_split = train_val_test_split
         self.log_transform_target = log_transform_target
-        self.graph_path=graph_path
+        self.graph_variant = graph_variant
+        self.graph_embedding_version = graph_embedding_version
+        self.graph_path = f"graphs/{graph_variant}_{graph_embedding_version}"
+        self.use_ocean_nodes = graph_variant != 'no_ocean' # the model has to be built to match the graph
+        self.local_ocean_coupling = graph_variant == 'local_ocean' # ocean->basin edges only to the nearest clusters
         self.num_ocean_clusters = num_ocean_clusters
+        self.twsa_anomaly = twsa_anomaly
+        self.era5_anomaly = era5_anomaly
+        self._ensure_graph_meta()
 
         self.save_hyperparameters(logger=False)
 
@@ -66,7 +84,7 @@ class TWSA_HeteroGraphDatamodule(LightningDataModule):
             self.land_ocean_mask = (self.ds['lsm']>land_threshold) # 1 is land, 0 is ocean, by changing resolution, land pixels could be <1 but never 0
         else:
             self.land_ocean_mask = None
-            Warning("No land sea mask found in dataset.")
+            warnings.warn("No land sea mask found in dataset.")
         if input_vars is not None:
             # subset the dataset to only include input variables
             self.ds = self.ds[input_vars] 
@@ -78,14 +96,47 @@ class TWSA_HeteroGraphDatamodule(LightningDataModule):
         self.num_ocean_features = len(self.ocean_features)+2 # +2 for the temporal encoding
         
         self.train_val_test_periods = self.get_train_val_test_periods()
-     
-        self.edge_index = None
+        # raw training climatology [month, lat, lon] in cm, also needed by eval in both modes.
+        # float32 so it does not promote the datasets' twsa, NaN (Antarctica, ocean) -> 0
+        self.twsa_climatology = (self.ds['twsa'].sel(time=slice(*self.train_val_test_periods['train']))
+                                 .groupby('time.month').mean('time').fillna(0).astype(np.float32))
+        # same for every other input (the ERA5 variables), NaN outside a variable's domain -> 0.
+        # only built when used: with input_vars=['twsa'] there is nothing to average
+        self.era5_climatology = (self.ds[[v for v in self.input_vars if v != 'twsa']]
+                                 .sel(time=slice(*self.train_val_test_periods['train']))
+                                 .groupby('time.month').mean('time').fillna(0).astype(np.float32)
+                                 if era5_anomaly else None)
+
         self.scaling_mean_std = None
         self.ocean_clustering = None
         self.land_clustering = None
         self.data_train: Optional[Dataset] = None
         self.data_val: Optional[Dataset] = None
         self.data_test: Optional[Dataset] = None
+
+    def _ensure_graph_meta(self):
+        '''Make sure the cached graph files in self.graph_path were built for this variant,
+        embedding version, dataset and number of ocean clusters. The cached edge indices are
+        keyed only by k but their node indices depend on the mesh size
+        (n_basins + num_ocean_clusters), so without this check a stale cache would be loaded
+        silently.'''
+        meta = {'variant': self.graph_variant,
+                'embedding_version': self.graph_embedding_version,
+                'ds_path': self.ds_path,
+                'num_ocean_clusters': self.num_ocean_clusters}
+        meta_file = Path(self.graph_path) / 'meta.json'
+        if not Path(self.graph_path).exists():
+            Path(self.graph_path).mkdir(parents=True)
+            meta_file.write_text(json.dumps(meta, indent=2))
+            print(f"Created new graph directory {self.graph_path} with {meta}")
+            return
+        assert meta_file.exists(), (f"Graph directory {self.graph_path} exists but has no meta.json - "
+                                    "it was built before graph variants were tracked. Delete it or "
+                                    "choose a different graph_variant/graph_embedding_version.")
+        cached_meta = json.loads(meta_file.read_text())
+        assert cached_meta == meta, (f"Cached graph in {self.graph_path} was built with {cached_meta}, "
+                                     f"but this run expects {meta}")
+        print(f"Using cached graph directory {self.graph_path} with {cached_meta}")
 
 
     def get_train_val_test_periods(self):     
@@ -130,6 +181,10 @@ class TWSA_HeteroGraphDatamodule(LightningDataModule):
                                                     features_nanfill=0, 
                                                     graph_path=self.graph_path,
                                                     num_ocean_clusters=self.num_ocean_clusters,
+                                                    use_ocean_nodes=self.use_ocean_nodes,
+                                                    local_ocean_coupling=self.local_ocean_coupling,
+                                                    twsa_climatology=self.twsa_climatology if self.twsa_anomaly else None,
+                                                    era5_climatology=self.era5_climatology if self.era5_anomaly else None,
                                                     train_val_test_data='train')
                 
                 self.scaling_mean_std = self.data_train.scaling_params
@@ -155,6 +210,10 @@ class TWSA_HeteroGraphDatamodule(LightningDataModule):
                                                     features_nanfill=0,
                                                     graph_path=self.graph_path,
                                                     num_ocean_clusters=self.num_ocean_clusters, 
+                                                    use_ocean_nodes=self.use_ocean_nodes,
+                                                    local_ocean_coupling=self.local_ocean_coupling,
+                                                    twsa_climatology=self.twsa_climatology if self.twsa_anomaly else None,
+                                                    era5_climatology=self.era5_climatology if self.era5_anomaly else None,
                                                     train_val_test_data='val')
         if stage == "validate":
                     # load datasets only if they're not loaded already
@@ -174,6 +233,10 @@ class TWSA_HeteroGraphDatamodule(LightningDataModule):
                                                     features_nanfill=0,
                                                     graph_path=self.graph_path,
                                                     num_ocean_clusters=self.num_ocean_clusters,
+                                                    use_ocean_nodes=self.use_ocean_nodes,
+                                                    local_ocean_coupling=self.local_ocean_coupling,
+                                                    twsa_climatology=self.twsa_climatology if self.twsa_anomaly else None,
+                                                    era5_climatology=self.era5_climatology if self.era5_anomaly else None,
                                                     train_val_test_data='val')
                 
   
@@ -195,6 +258,10 @@ class TWSA_HeteroGraphDatamodule(LightningDataModule):
                                                     features_nanfill=0,
                                                     graph_path=self.graph_path,
                                                     num_ocean_clusters=self.num_ocean_clusters,
+                                                    use_ocean_nodes=self.use_ocean_nodes,
+                                                    local_ocean_coupling=self.local_ocean_coupling,
+                                                    twsa_climatology=self.twsa_climatology if self.twsa_anomaly else None,
+                                                    era5_climatology=self.era5_climatology if self.era5_anomaly else None,
                                                     train_val_test_data='test')
         if stage == "predict":
             pass
@@ -327,6 +394,10 @@ class TWSA_HeteroGraphDatamodule(LightningDataModule):
                                                     features_nanfill=0,
                                                     graph_path=self.graph_path,
                                                     num_ocean_clusters=self.num_ocean_clusters,
+                                                    use_ocean_nodes=self.use_ocean_nodes,
+                                                    local_ocean_coupling=self.local_ocean_coupling,
+                                                    twsa_climatology=self.twsa_climatology if self.twsa_anomaly else None,
+                                                    era5_climatology=self.era5_climatology if self.era5_anomaly else None,
                                                     train_val_test_data='predict')
         return pygDataLoader(dataset=self.data_pred,
                     batch_size=self.hparams.batch_size,
@@ -335,19 +406,21 @@ class TWSA_HeteroGraphDatamodule(LightningDataModule):
                     drop_last=False,
             )
     
-    def GRACE_dataloader(self, stage='test', time_step_idx: int=None):
-        """Dataloader that gets the dataset with GRACE-derived TWSA instead of the reconstructed TWSA"""
-        grace_dataset = xr.open_dataset('data/latest_data/GRACE_era5_1deg_detrend_latavg_tempmatch.nc')
+    def GRACE_dataloader(self, stage='test', time_step_idx: int=None, twsa_climatology=None):
+        """Dataloader that gets the dataset with GRACE-derived TWSA instead of the reconstructed TWSA.
+        twsa_climatology: [month, lat, lon] used instead of the training climatology for the twsa
+            input anomaly and twsa_offset (anomaly mode only). ERA5 climatology and scaling stay the training ones."""
+        if twsa_climatology is not None and not self.twsa_anomaly:
+            raise ValueError("twsa_climatology needs twsa_anomaly=True")
+        if twsa_climatology is None:
+            twsa_climatology = self.twsa_climatology
+        grace_dataset = xr.open_dataset('data/processed/GRACE_era5.nc')
         
         if 'detrended_twsa' in grace_dataset.data_vars.keys():
             grace_dataset = grace_dataset.rename({"detrended_twsa":"twsa"}) # make sure naming conventions are consistent
     
         if grace_dataset['lat'][0] < grace_dataset['lat'][-1]:
             grace_dataset = grace_dataset.sortby('lat', ascending=False)
-        
-        lat = grace_dataset['lat'].values.copy()
-        lat[0] = 89.5
-        grace_dataset = grace_dataset.assign_coords(lat=lat)
         
         grace_dataset['twsa'] = xr.where(grace_dataset.lsm, grace_dataset['twsa'], 0.0) #mask out ocean pixels in TWSA data to avoid confusion for the model, since the input features also have ocean pixels masked out
         
@@ -373,6 +446,10 @@ class TWSA_HeteroGraphDatamodule(LightningDataModule):
                                                     features_nanfill=0,
                                                     graph_path=self.graph_path,
                                                     num_ocean_clusters=self.num_ocean_clusters,
+                                                    use_ocean_nodes=self.use_ocean_nodes,
+                                                    local_ocean_coupling=self.local_ocean_coupling,
+                                                    twsa_climatology=twsa_climatology if self.twsa_anomaly else None,
+                                                    era5_climatology=self.era5_climatology if self.era5_anomaly else None,
                                                     train_val_test_data='grace')
             return pygDataLoader(dataset=self.data_pred,
                     batch_size=self.hparams.batch_size,

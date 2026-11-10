@@ -5,6 +5,9 @@ Memory-efficient script for:
 1. Computing SHAP values for GNN outputs
 2. Computing SHAP values for LSTM outputs
 3. Plotting results
+
+Kept for the record only: this attribution analysis was removed from the revised results, where the ablations
+(results_tables.py, basin_ablation.py) and the latent removal (run_latent_removal.py) replace it.
 """
 
 # SET GPU FIRST - BEFORE ALL OTHER IMPORTS
@@ -22,7 +25,7 @@ import pytorch_lightning as pl
 import yaml
 import matplotlib.pyplot as plt
 import seaborn as sns
-from typing import Dict, Tuple, Any
+from typing import Dict, Tuple
 
 
 from captum.attr import Saliency, NoiseTunnel
@@ -48,6 +51,7 @@ def load_model_and_data(config: Dict, checkpoint_path: str, device):
         **config['model'],
         num_input_features=datamodule.num_features,
         num_ocean_features=datamodule.num_ocean_features,
+        use_ocean_nodes=datamodule.use_ocean_nodes,
         sequence_length=datamodule.input_seq_len,
         output_seq_len=datamodule.target_seq_len, 
         land_sea_mask=None,
@@ -145,21 +149,27 @@ def compute_gnn_latent_importance(model, data, n_steps=25):
         # rule of thumb: stdevs ~ 0.1 * input.std()
         stdevs_gnn  = 0.1 * input_ts.std().item()
         # stdevs_twsa = 0.1 * twsa_input_d.std().item()
-        # Attribution shape: [batch, seq_len, gnn_emb_dim]
-        attribution = nt.attribute(
-            input_ts,
-            nt_type='smoothgrad',       # average of gradients under noise
-            nt_samples=n_steps,      # number of noisy samples
-            stdevs=stdevs_gnn,
-            abs=False                   # keep sign, take abs later
-        )
+        # NoiseTunnel stacks nt_samples noisy copies into one LSTM batch; chunk so the LSTM never
+        # sees more rows than in training (n_steps*batch_size rows crash cuDNN with an illegal memory access)
+        chunk_size = -(-batch_size // n_steps)
+        attr_sum = 0
+        for chunk in input_ts.split(chunk_size):
+            # Attribution shape: [chunk, seq_len, gnn_emb_dim]
+            attribution = nt.attribute(
+                chunk,
+                nt_type='smoothgrad',       # average of gradients under noise
+                nt_samples=n_steps,      # number of noisy samples
+                stdevs=stdevs_gnn,
+                abs=False                   # keep sign, take abs later
+            )
+            attr_sum = attr_sum + attribution.abs().sum(dim=[0,1])
+            del attribution
 
-        
-        all_attributions.append(attribution.abs().mean(dim=[0,1]).cpu())
+        all_attributions.append((attr_sum / (batch_size * model.seq_len)).cpu())
         print(f"Horizon step {i+1}/{model.horizon} done")
-        
-        
-        del attribution #, pred_input, pred_baseline, attr_sum, expected_diff
+
+
+        del attr_sum #, pred_input, pred_baseline, expected_diff
         torch.cuda.empty_cache()
 
     
@@ -249,18 +259,16 @@ def save_config(config, path):
     with open(path, 'w') as file:
         yaml.dump(config, file)
 
-def create_experiment_dir(config: Dict[str, Any]) -> str:
-    """Create experiment directory.
+def create_experiment_dir(exp_path: str) -> str:
+    """Create feature-importance output directory inside the experiment directory.
 
     Args:
-        config: config file
-        dataset: dataset name (test or grace)
+        exp_path: experiment directory
 
     Returns:
-        config with updated save_dir
+        path of the created output directory
     """
-    #os.makedirs(config["experiment"]["exp_dir"], exist_ok=True)
-    exp_dir_path = os.path.join(f"fi_analysis", config["experiment"]["save_dir"])
+    exp_dir_path = os.path.join(exp_path, "fi_analysis")
     os.makedirs(exp_dir_path, exist_ok=True)
     return exp_dir_path
 
@@ -634,7 +642,7 @@ def main(args):
     num_features = model.model.num_features
     gnn_embedding_dim = model.model.gnn_embedding_dim
 
-    output_dir=create_experiment_dir(config)
+    output_dir=create_experiment_dir(args.exp_path)
     
     print(f"✓ Model loaded")
     print(f"  - Num features: {num_features}")

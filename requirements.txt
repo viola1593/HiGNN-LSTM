@@ -3,24 +3,24 @@ torch>=2.5
 torch-geometric>=2.6
 torchmetrics>=1.6
 pytorch-lightning>=2.4
+torchinfo>=1.8
 captum>=0.7
 
 # torch-scatter and torch-sparse must be installed separately matching your torch/CUDA version:
 # pip install torch-scatter torch-sparse -f https://data.pyg.org/whl/torch-2.5.0+cu124.html
 
-# Spatiotemporal GNN
-torch-spatiotemporal>=0.9
-
 # Data
 numpy>=1.26
 pandas>=2.2
 xarray>=2024.9
+netCDF4>=1.7
+h5py>=3.11
 scipy>=1.14
 
 # Geo/Graph
 geopandas>=1.0
 shapely>=2.0
-networkx>=3.2
+pyproj>=3.6
 
 # Visualization
 matplotlib>=3.9
@@ -31,3 +31,8 @@ scikit-learn>=1.5
 tqdm>=4.66
 PyYAML>=6.0
 wandb>=0.18
+
+# Preprocessing only (scripts/preprocess_data/)
+# get_watersheds.py needs an authenticated Google Earth Engine account
+earthengine-api>=1.1
+cdsapi>=0.7

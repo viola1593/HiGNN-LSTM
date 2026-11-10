@@ -37,12 +37,15 @@ def generate_trainer(config: Dict[str, Any]) -> pl.Trainer:
     checkpoint_callback = pl.callbacks.ModelCheckpoint(dirpath=config["experiment"]["save_dir"], 
                                                        save_top_k=1, monitor="val_rmse",
                                                        save_last=True)
+    callbacks = [checkpoint_callback]
+    if not config["debug"]: # LearningRateMonitor needs a logger
+        callbacks.append(pl.callbacks.LearningRateMonitor(logging_interval="epoch"))
 
     return pl.Trainer(
         **config["pl"],
         default_root_dir=config["experiment"]["save_dir"],
         logger=loggers,
-        callbacks=[checkpoint_callback]
+        callbacks=callbacks
         )
 
 
@@ -58,6 +61,8 @@ def create_experiment_dir(config: Dict[str, Any]) -> str:
     os.makedirs(config["experiment"]["exp_dir"], exist_ok=True)
     exp_dir_name = (
         f"{config['experiment']['experiment_name']}"
+        f"_{config['datamodule']['graph_variant']}"
+        f"_seed{config['experiment']['seed']}"
         f"_{datetime.now().strftime('%m-%d-%Y_%H:%M:%S')}"
     )
     exp_dir_path = os.path.join(config["experiment"]["exp_dir"], exp_dir_name)
@@ -72,8 +77,7 @@ def plot_prediction(y_hat, y_true, y_last,
                       trainer=None, 
                       name='0', 
                       title='TWSA Prediction on Train Set',
-                      antarctica_mask=None, 
-                      overfitting=False):
+                      antarctica_mask=None):
     lon, lat = datamodule.data_pred.land[0][:,0], datamodule.data_pred.land[0][:,1]
     if antarctica_mask is not None:
         lon, lat = lon[antarctica_mask], lat[antarctica_mask]
@@ -108,12 +112,13 @@ def plot_prediction(y_hat, y_true, y_last,
         plt.close() 
 
 
-def train(config_path):
+def train(config_path, seed=42):
     """Training Script."""
     # torch.set_float32_matmul_precision("medium")
-    
-    pl.seed_everything(42, workers=True)
+
     config = read_config(config_path)
+    config["experiment"]["seed"] = seed
+    pl.seed_everything(seed, workers=True)
     config = create_experiment_dir(config)
 
     # generate trainer
@@ -132,10 +137,12 @@ def train(config_path):
         model = gnn_model.load_from_checkpoint(config["load_checkpoint"], **config["model"], 
                                 num_input_features=twsa_sequence_data.num_features,
                                 num_ocean_features=twsa_sequence_data.num_ocean_features,
+                              use_ocean_nodes=twsa_sequence_data.use_ocean_nodes,
                               sequence_length=twsa_sequence_data.input_seq_len, 
                               output_seq_len=twsa_sequence_data.target_seq_len, 
                               land_sea_mask=None)
-        trainer.loggers[0].watch(model, log='all')
+        if not config["debug"]:
+            trainer.loggers[0].watch(model, log='all')
         trainer.fit(model, datamodule=twsa_sequence_data, ckpt_path=(config["load_checkpoint"]))
     else:
         # generate model
@@ -144,6 +151,7 @@ def train(config_path):
         model = gnn_model(**config["model"],
                               num_input_features=twsa_sequence_data.num_features,
                               num_ocean_features=twsa_sequence_data.num_ocean_features,
+                              use_ocean_nodes=twsa_sequence_data.use_ocean_nodes,
                               sequence_length=twsa_sequence_data.input_seq_len, 
                               output_seq_len=twsa_sequence_data.target_seq_len, land_sea_mask=None) #static_feat=twsa_sequence_data.data_train.static_feat)#twsa_sequence_data.lsm)
         
@@ -169,13 +177,11 @@ def train(config_path):
     if not config['debug']:
         antarctica_mask = (~twsa_sequence_data.get_antarctica_landmask())
         if config['pl']['overfit_batches']>0:
-            overfitting=True
             title = 'TWSA Prediction on Train Set'
             metrics_val = trainer.validate(model, dataloaders=twsa_sequence_data.train_dataloader())
             prediction_period = twsa_sequence_data.train_val_test_periods['train']
   
         else:
-            overfitting=False
             title = 'TWSA Prediction on Val Set'
             metrics_val = trainer.validate(model, datamodule=twsa_sequence_data) 
             prediction_period = twsa_sequence_data.train_val_test_periods['val']
@@ -192,14 +198,13 @@ def train(config_path):
         preds, true, input, graphs, _ = trainer.predict(model, 
                                                      dataloaders=prediction_dl)[0]
          
-        num_ocean_clusters = twsa_sequence_data.num_ocean_clusters
         preds = preds[antarctica_mask]
         true = true[antarctica_mask]
         
         for i in range(config['datamodule']['output_seq_len']):
             twsa_pred = preds[:,i]
             twsa_true = true[:,i]
-            if i ==0:
+            if i ==0: # in anomaly mode this input is twsa - C, so the first 'Last TWSA' panel shows the anomaly
                 last_twsa = input['grid'].x[:,-1,0]
                 last_twsa = twsa_sequence_data.unnormalize_twsa(last_twsa)[antarctica_mask]
             else:
@@ -208,8 +213,7 @@ def train(config_path):
             
             plot_prediction(twsa_pred, twsa_true, last_twsa, twsa_sequence_data, 
                             save_dir=None, trainer=trainer, name=f'Prediction_month_{i}', title=title,
-                            antarctica_mask=antarctica_mask, 
-                            overfitting=overfitting)
+                            antarctica_mask=antarctica_mask)
          
        
         
@@ -225,10 +229,12 @@ def start():
     )
 
     parser.add_argument("--config_path", help="Path to the config file", required=True)
+    parser.add_argument("--seed", type=int, default=42,
+                        help="Random seed for weight init and shuffling")
 
     args = parser.parse_args()
 
-    train(args.config_path)
+    train(args.config_path, args.seed)
 
 
 if __name__ == "__main__":
