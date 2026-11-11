@@ -10,9 +10,8 @@ If you do not wish to run the preprocessing pipeline from scratch, the preproces
 results are available on Zenodo: [10.5281/zenodo.24135096](https://doi.org/10.5281/zenodo.24135096). The earlier version of the record
 ([10.5281/zenodo.19664592](https://doi.org/10.5281/zenodo.19664592)) holds the data of the previous version, with
 different file names and an older preprocessing; it does not match the configs in this repository.
-The GRACE/GRACE-FO files (`GRACE_era5.nc`, `GRACE_climatology_pre2008.nc`) are not part of the record: build them
-from the CSR mascons (see below) with `02a_join_graceTWSA_era5.py` and `05_grace_climatology.py`; 02a also needs the
-raw ERA5 files.
+The GRACE climatology (`GRACE_climatology_pre2008.nc`) is not part of the record: build them
+from the CSR mascons (see below) with `05_grace_climatology.py`; 
 
 ### Expected layout
 
