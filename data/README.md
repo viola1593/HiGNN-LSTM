@@ -7,7 +7,7 @@ This document describes the datasets required to train and evaluate the HiGNN-LS
 ## Preprocessed Datasets
 
 If you do not wish to run the preprocessing pipeline from scratch, the preprocessed datasets of the revised
-results are available on Zenodo: `<add link of the revised Zenodo version>`. The earlier version of the record
+results are available on Zenodo: [10.5281/zenodo.24135096](https://doi.org/10.5281/zenodo.24135096). The earlier version of the record
 ([10.5281/zenodo.19664592](https://doi.org/10.5281/zenodo.19664592)) holds the data of the previous version, with
 different file names and an older preprocessing; it does not match the configs in this repository.
 The GRACE/GRACE-FO files (`GRACE_era5.nc`, `GRACE_climatology_pre2008.nc`) are not part of the record: build them

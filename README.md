@@ -134,7 +134,7 @@ GRACE-REC and ERA5 are used for model training and testing. The CSR mascon produ
 
 **ERA5 variables required:** 2m temperature, sea surface temperature, surface pressure, total precipitation, 10m wind speed, evaporation, potential evaporation, runoff, land-sea mask.
 
-See `data/README.md` for the ERA5 CDS API request and the expected directory layout. The preprocessed data used for the revised results will be available at `<add Zenodo link of the revised data version>`, except the GRACE/GRACE-FO files, which have to be built with steps 02a and 05.
+See `data/README.md` for the ERA5 CDS API request and the expected directory layout. The preprocessed data used for the revised results is available at [10.5281/zenodo.24135096](https://doi.org/10.5281/zenodo.24135096).
 
 ### Preprocessing
 
